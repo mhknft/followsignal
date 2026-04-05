@@ -118,8 +118,9 @@ export async function GET(
     pick(src, "verified", "isVerified", "is_verified"),
   );
 
-  const rawScore  = extractScore(scoreRaw);
-  const score     = Math.max(rawScore, 800); // floor of 800 per requirements
+  // Use the real Sorsa score for display — no artificial floor.
+  // The 800 floor is only applied inside the scan/recommendation logic.
+  const score = extractScore(scoreRaw);
 
   const profile: SearchedProfile = {
     displayName,
