@@ -6,7 +6,7 @@ const BASE = "https://api.sorsa.io/v3";
 // ─── Normalised internal type ─────────────────────────────────────────────────
 
 type NormalisedAccount = {
-  username: string;   // without @
+  username: string; // without @
   name: string;
   followers: number;
   score: number;
@@ -15,10 +15,6 @@ type NormalisedAccount = {
 
 // ─── Defensive field extraction ───────────────────────────────────────────────
 
-/**
- * Walk every known field name variant and return the first truthy value.
- * All Sorsa API responses are treated as `unknown` to avoid silent crashes.
- */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function pick(obj: Record<string, any>, ...keys: string[]): unknown {
   for (const k of keys) {
@@ -63,19 +59,19 @@ function normaliseAccount(raw: Record<string, any>): NormalisedAccount {
   };
 }
 
-/** Extract an array of raw account objects from any Sorsa envelope shape. */
+/** Extract an array of normalised accounts from any Sorsa envelope shape. */
 function extractList(raw: unknown): NormalisedAccount[] {
   if (!raw || typeof raw !== "object") return [];
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const obj = raw as Record<string, any>;
 
-  // Find the array — try every key that Sorsa might use
   let arr: unknown[] | null = null;
   if (Array.isArray(raw)) {
     arr = raw;
   } else {
-    for (const key of ["data", "users", "accounts", "results", "items", "list", "followers", "following"]) {
+    for (const key of ["data", "users", "accounts", "results", "items", "list",
+                        "followers", "following", "follows"]) {
       if (Array.isArray(obj[key])) { arr = obj[key]; break; }
     }
   }
@@ -88,7 +84,7 @@ function extractList(raw: unknown): NormalisedAccount[] {
     .map(normaliseAccount);
 }
 
-/** Extract the Sorsa score for the searched user's own profile. */
+/** Extract the searched user's own Sorsa score from the /score response. */
 function extractProfileScore(raw: unknown): number {
   if (!raw || typeof raw !== "object") return 0;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -100,7 +96,6 @@ function extractProfileScore(raw: unknown): number {
     return isNaN(n) ? 0 : n;
   }
 
-  // Nested under data / user / result
   for (const key of ["data", "user", "result", "profile"]) {
     if (obj[key] && typeof obj[key] === "object") {
       const nested = pick(obj[key], "score", "sorsaScore", "sorsa_score", "orbitScore");
@@ -114,7 +109,7 @@ function extractProfileScore(raw: unknown): number {
   return 0;
 }
 
-/** Is this normalised account valid enough to use? */
+/** Drop accounts with empty username, NaN score, or non-finite score. */
 function isValid(acc: NormalisedAccount): boolean {
   return (
     acc.username.length > 0 &&
@@ -127,13 +122,11 @@ function isValid(acc: NormalisedAccount): boolean {
 // ─── Score threshold logic ────────────────────────────────────────────────────
 
 /**
- * Minimum Sorsa score a candidate must have to appear in results.
- *
- *  - Searched profile score < 800   → threshold = 800
- *  - Searched profile score 800–3000 → threshold = profileScore + 500
- *  - Searched profile score > 3000   → threshold = 3500
- *
- * The floor is always 800.
+ * Minimum Sorsa score a candidate must have.
+ *  - profile score < 800   → threshold 800
+ *  - profile score 800–3000 → threshold = profileScore + 500
+ *  - profile score > 3000   → threshold 3500
+ * Floor of 800 is always enforced.
  */
 function getScoreThreshold(profileScore: number): number {
   if (profileScore < 800)   return 800;
@@ -149,7 +142,6 @@ function formatScore(n: number): string {
   return n.toString();
 }
 
-/** Never crashes — accepts unknown so callers don't need to pre-validate. */
 function formatFollowers(value: unknown): string {
   const n = Number(value || 0);
   if (isNaN(n) || !isFinite(n)) return "0";
@@ -170,12 +162,11 @@ function buildReason(score: number, followers: number, name: string): string {
   const s = formatScore(score);
   const f = formatFollowers(followers);
   const lines = [
-    `Sorsa score ${s}. ${f} followers and rising presence in your extended network.`,
-    `High network affinity. Score ${s} places ${name} in the top tier of your orbit.`,
-    `Score ${s} · ${f} followers. Strong engagement overlap with your audience signals.`,
-    `${f} followers · score ${s}. Positioned at the outer edge of your influence sphere.`,
+    `Sorsa score ${s}. ${f} followers. You follow them — they haven't followed back yet.`,
+    `Score ${s} · ${f} followers. High-value account in your follow graph with no reciprocation.`,
+    `${f} followers · score ${s}. You're in their extended orbit — follow-back signal detected.`,
+    `High network affinity. Score ${s} places ${name} in the top tier of your non-followback list.`,
   ];
-  // Stable pick — won't throw even if score is 0
   return lines[Math.abs(Math.round(score)) % lines.length];
 }
 
@@ -197,7 +188,7 @@ const POSITIONS: PredictedAccount["position"][] = [
   "top-right",
   "lower-left",
   "lower-right",
-  "bottom-center", // wildcard slot (highest score)
+  "bottom-center", // wildcard slot — highest score
 ];
 
 // ─── Route handler ────────────────────────────────────────────────────────────
@@ -209,44 +200,47 @@ export async function GET(
   const { username } = await params;
 
   try {
-    // ── 1. Parallel fetch all four endpoints ──────────────────────────────────
-    const [followersRaw, followingRaw, followsRaw, scoreRaw] = await Promise.allSettled([
-      sorsaFetch(`/top-followers?username=${encodeURIComponent(username)}`),
-      sorsaFetch(`/top-following?username=${encodeURIComponent(username)}`),
-      sorsaFetch(`/follows?username=${encodeURIComponent(username)}`),
+    // ── 1. Parallel fetch ─────────────────────────────────────────────────────
+    //
+    // Relationship rule:
+    //   candidates  = /following  (accounts the searched user follows)
+    //   exclusions  = /followers  (accounts that already follow them back)
+    //   result      = candidates NOT in exclusions  →  non-followback accounts
+    //
+    const [followingRaw, followersRaw, scoreRaw] = await Promise.allSettled([
+      sorsaFetch(`/following?username=${encodeURIComponent(username)}`),
+      sorsaFetch(`/followers?username=${encodeURIComponent(username)}`),
       sorsaFetch(`/score?username=${encodeURIComponent(username)}`),
     ]);
 
-    // ── 2. Log raw shapes so field names are visible in server logs ───────────
-    console.log("[scan] /top-followers raw:",
-      JSON.stringify(followersRaw.status === "fulfilled" ? followersRaw.value : followersRaw.reason));
-    console.log("[scan] /top-following raw:",
+    // ── 2. Log raw shapes ─────────────────────────────────────────────────────
+    console.log("[scan] /following raw:",
       JSON.stringify(followingRaw.status === "fulfilled" ? followingRaw.value : followingRaw.reason));
-    console.log("[scan] /follows raw:",
-      JSON.stringify(followsRaw.status === "fulfilled" ? followsRaw.value : followsRaw.reason));
+    console.log("[scan] /followers raw:",
+      JSON.stringify(followersRaw.status === "fulfilled" ? followersRaw.value : followersRaw.reason));
     console.log("[scan] /score raw:",
       JSON.stringify(scoreRaw.status === "fulfilled" ? scoreRaw.value : scoreRaw.reason));
 
-    // ── 3. Extract lists (graceful degradation if an endpoint fails) ──────────
-    const topFollowers = followersRaw.status === "fulfilled" ? extractList(followersRaw.value) : [];
-    const topFollowing = followingRaw.status === "fulfilled" ? extractList(followingRaw.value) : [];
-    const follows      = followsRaw.status  === "fulfilled" ? extractList(followsRaw.value)  : [];
-    const profileScore = scoreRaw.status    === "fulfilled" ? extractProfileScore(scoreRaw.value) : 0;
+    // ── 3. Extract lists ──────────────────────────────────────────────────────
+    const following     = followingRaw.status === "fulfilled" ? extractList(followingRaw.value) : [];
+    const followers     = followersRaw.status === "fulfilled" ? extractList(followersRaw.value) : [];
+    const profileScore  = scoreRaw.status     === "fulfilled" ? extractProfileScore(scoreRaw.value) : 0;
 
-    console.log(`[scan] profileScore=${profileScore}  topFollowers=${topFollowers.length}  topFollowing=${topFollowing.length}  follows=${follows.length}`);
+    console.log(`[scan] profileScore=${profileScore}  following=${following.length}  followers=${followers.length}`);
 
-    // ── 4. Build exclusion set ────────────────────────────────────────────────
-    const followedSet = new Set(
-      follows
+    // ── 4. Build follower-back exclusion set ──────────────────────────────────
+    //  Anyone already in the followers list is excluded — they follow back.
+    const followsBackSet = new Set(
+      followers
         .filter(isValid)
         .map((u) => u.username.toLowerCase()),
     );
 
-    // ── 5. Merge candidates, deduplicated by username ─────────────────────────
+    // ── 5. Candidates = the following list, deduped ───────────────────────────
     const seen = new Set<string>();
     const candidates: NormalisedAccount[] = [];
 
-    for (const entry of [...topFollowers, ...topFollowing]) {
+    for (const entry of following) {
       const key = entry.username.toLowerCase();
       if (key && !seen.has(key)) {
         seen.add(key);
@@ -256,14 +250,14 @@ export async function GET(
 
     console.log(`[scan] candidates before filter: ${candidates.length}`);
 
-    // ── 6. Apply threshold, exclusion, validity ───────────────────────────────
+    // ── 6. Apply filters ──────────────────────────────────────────────────────
     const threshold = getScoreThreshold(profileScore);
     console.log(`[scan] score threshold: ${threshold}`);
 
     const filtered = candidates
       .filter(isValid)
-      .filter((c) => !followedSet.has(c.username.toLowerCase()))
-      .filter((c) => c.score >= threshold && c.score >= 800) // always enforce floor
+      .filter((c) => !followsBackSet.has(c.username.toLowerCase())) // not following back
+      .filter((c) => c.score >= threshold && c.score >= 800)        // score floor
       .sort((a, b) => b.score - a.score)
       .slice(0, 5);
 
@@ -273,16 +267,16 @@ export async function GET(
     if (filtered.length === 0) {
       return NextResponse.json({
         predictions: [],
-        message: "No stronger matches found above your current orbit score",
+        message: "No stronger non-followback matches found",
       });
     }
 
     // ── 8. Build PredictedAccount array ──────────────────────────────────────
-    // Highest scorer → wildcard (bottom-center); rest fill corner positions
+    // Highest scorer → wildcard (bottom-center); rest fill corners in score order
     const [wildcard, ...corners] = filtered;
     const ordered = [...corners, wildcard];
 
-    const maxScore = wildcard.score || 1; // avoid /0
+    const maxScore = wildcard.score || 1;
 
     const predictions: PredictedAccount[] = ordered.map((entry, i) => {
       const isWild = i === ordered.length - 1;
@@ -307,7 +301,7 @@ export async function GET(
     return NextResponse.json(
       {
         predictions: [],
-        message: "No stronger matches found above your current orbit score",
+        message: "No stronger non-followback matches found",
         error: String(err),
       },
       { status: 500 },

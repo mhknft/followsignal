@@ -3,6 +3,7 @@
 import { use, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
+import Image from "next/image";
 import Background from "../../components/Background";
 import ParticleField from "../../components/ParticleField";
 import OrbitalScanner from "../../components/OrbitalScanner";
@@ -10,6 +11,12 @@ import { generateDisplayName } from "../../data/generateProfile";
 
 interface Props {
   params: Promise<{ username: string }>;
+}
+
+interface RealProfile {
+  name: string | null;
+  username: string;
+  avatar: string | null;
 }
 
 const STEPS = [
@@ -25,16 +32,26 @@ const TOTAL = STEPS.reduce((s, x) => s + x.duration, 0); // ~4 400 ms
 export default function ScanPage({ params }: Props) {
   const { username } = use(params);
   const router = useRouter();
-  const displayName = generateDisplayName(username);
 
+  // Fallback display name while real profile loads
+  const fallbackName = generateDisplayName(username);
+
+  const [profile, setProfile] = useState<RealProfile | null>(null);
   const [currentStep, setCurrentStep] = useState(0);
   const [completedSteps, setCompletedSteps] = useState<number[]>([]);
   const [elapsed, setElapsed] = useState(0);
 
+  // Fetch real profile immediately — replaces fallback as soon as it arrives
+  useEffect(() => {
+    fetch(`/api/profile/${encodeURIComponent(username)}`)
+      .then((r) => r.json())
+      .then((data: RealProfile) => setProfile(data))
+      .catch(() => {/* keep fallback */});
+  }, [username]);
+
   // Step sequencer
   useEffect(() => {
     let step = 0;
-    let total = 0;
 
     const next = () => {
       if (step >= STEPS.length) return;
@@ -61,7 +78,7 @@ export default function ScanPage({ params }: Props) {
     return () => clearInterval(id);
   }, []);
 
-  // Navigate after all steps
+  // Navigate after all steps complete
   useEffect(() => {
     if (completedSteps.length === STEPS.length) {
       const t = setTimeout(() => router.push(`/results/${username}`), 400);
@@ -70,6 +87,10 @@ export default function ScanPage({ params }: Props) {
   }, [completedSteps, username, router]);
 
   const progress = Math.min(elapsed / TOTAL, 1);
+
+  // Use real data if available, fall back to generated name + no avatar
+  const displayName = profile?.name || fallbackName;
+  const avatarUrl   = profile?.avatar || null;
 
   return (
     <main className="relative min-h-screen bg-black overflow-hidden flex flex-col items-center justify-center">
@@ -106,7 +127,7 @@ export default function ScanPage({ params }: Props) {
       {/* Main content */}
       <div className="relative z-20 flex flex-col items-center text-center px-6 gap-8">
 
-        {/* Username label */}
+        {/* Username scanning pill */}
         <motion.div
           initial={{ opacity: 0, y: 12 }}
           animate={{ opacity: 1, y: 0 }}
@@ -139,13 +160,41 @@ export default function ScanPage({ params }: Props) {
           <OrbitalScanner />
         </motion.div>
 
-        {/* Display name + headline */}
+        {/* Avatar + display name + handle */}
         <motion.div
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.7, delay: 0.4 }}
-          className="flex flex-col items-center gap-1"
+          className="flex flex-col items-center gap-2"
         >
+          {/* Real avatar — fades in when loaded, hidden while null */}
+          <AnimatePresence>
+            {avatarUrl && (
+              <motion.div
+                key="avatar"
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+                className="rounded-full overflow-hidden"
+                style={{
+                  width: 56,
+                  height: 56,
+                  border: "2px solid rgba(168,85,247,0.45)",
+                  boxShadow: "0 0 18px rgba(168,85,247,0.35)",
+                }}
+              >
+                <Image
+                  src={avatarUrl}
+                  alt={displayName}
+                  width={56}
+                  height={56}
+                  className="object-cover"
+                  unoptimized
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           <h1 className="text-2xl font-black text-white tracking-tight">
             {displayName}
           </h1>
@@ -191,7 +240,7 @@ export default function ScanPage({ params }: Props) {
           className="flex flex-col gap-2.5 w-full max-w-xs"
         >
           {STEPS.map((step, i) => {
-            const done = completedSteps.includes(i);
+            const done   = completedSteps.includes(i);
             const active = currentStep === i;
             return (
               <motion.div
@@ -248,7 +297,7 @@ export default function ScanPage({ params }: Props) {
                   {step.label}
                 </span>
 
-                {/* Active shimmer line */}
+                {/* Active shimmer */}
                 {active && (
                   <motion.div
                     animate={{ opacity: [0.4, 1, 0.4] }}

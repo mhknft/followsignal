@@ -128,7 +128,7 @@ export default function ConstellationLayout({ username, predictions, hasError }:
               <p className="text-[11px] text-white/30 leading-relaxed">
                 {hasError
                   ? "Couldn't reach the network. Check your connection and try again."
-                  : "No stronger matches found above your current orbit score."}
+                  : "No stronger non-followback matches found."}
               </p>
             </div>
           </motion.div>

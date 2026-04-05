@@ -194,7 +194,7 @@ export default function ShareCard({ username, predictions }: ShareCardProps) {
                 <div className="flex flex-col items-center gap-2 py-4">
                   <span className="text-lg">🔭</span>
                   <p className="text-[10px] text-white/30 text-center tracking-wide">
-                    No stronger matches found above your current orbit score
+                    No stronger non-followback matches found
                   </p>
                 </div>
               ) : (
