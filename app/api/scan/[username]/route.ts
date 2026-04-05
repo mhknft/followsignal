@@ -116,6 +116,70 @@ function isValid(acc: NormalisedAccount): boolean {
   return acc.username.length > 0 && !isNaN(acc.score) && isFinite(acc.score);
 }
 
+// ─── Relevance filter ─────────────────────────────────────────────────────────
+//
+// Removes obvious brand / org / protocol / celebrity accounts so only
+// individual creators, traders, and CT personalities appear as recommendations.
+
+/** Hard-blocked usernames — always excluded regardless of score. */
+const BLOCKED_USERNAMES = new Set([
+  "claude",
+  "anthropic",
+  "ethereum",
+  "ethereumfoundation",
+  "ethereumfndn",
+  "openai",
+  "google",
+  "tesla",
+  "openclaw",
+  "xdevelopers",
+  "binance",
+  "coinbase",
+]);
+
+/**
+ * Display-name tokens that strongly indicate an organisation, brand, protocol,
+ * exchange, or non-personal account.
+ */
+const ORG_NAME_TOKENS = new Set([
+  "foundation", "protocol", "official", "exchange",
+  "labs", "lab", "capital", "ventures", "venture",
+  "fund", "inc", "llc", "ltd", "corp", "dao",
+  "association", "organization", "org", "society",
+  "federation", "alliance", "coalition", "collective",
+  "institute", "media", "news", "team", "group",
+  "magazine", "journal", "network",
+]);
+
+/** Username suffix patterns that indicate org / project accounts. */
+const ORG_USERNAME_RE = [
+  /foundation$/i,
+  /official$/i,
+  /hq$/i,
+  /dao$/i,
+  /protocol$/i,
+  /exchange$/i,
+  /labs?$/i,
+  /capital$/i,
+  /ventures?$/i,
+];
+
+/**
+ * Returns true when a candidate looks like an organisation, brand, exchange,
+ * or protocol rather than an individual person.
+ */
+function looksLikeOrg(name: string, username: string): boolean {
+  // Split display name on whitespace and common punctuation
+  const tokens = name.toLowerCase().split(/[\s\-_.,&|/\\()\[\]+]+/);
+  for (const token of tokens) {
+    if (token && ORG_NAME_TOKENS.has(token)) return true;
+  }
+  for (const re of ORG_USERNAME_RE) {
+    if (re.test(username)) return true;
+  }
+  return false;
+}
+
 // ─── Score slots ─────────────────────────────────────────────────────────────
 //
 // Five explicitly defined score-gap slots, each targeting ONE candidate.
@@ -311,9 +375,11 @@ export async function GET(
     console.log(`  (following ${following.length} - ${following.length - nonFollowbacks.length} mutual = ${nonFollowbacks.length} candidates)`);
 
     // ── 5. Sort by followers_count, take top 1 000 ───────────────────────────
-    // Large pool ensures we always have enough scored candidates to fill all
-    // five slots, even for accounts with many mutual follows.
+    // Apply username blacklist + org-detection heuristic BEFORE scoring so we
+    // don't waste API calls on brands, foundations, exchanges, or protocols.
     const top1000 = [...nonFollowbacks]
+      .filter((acc) => !BLOCKED_USERNAMES.has(acc.username.toLowerCase()))
+      .filter((acc) => !looksLikeOrg(acc.name, acc.username))
       .sort((a, b) => b.followers - a.followers)
       .slice(0, 1000);
 
