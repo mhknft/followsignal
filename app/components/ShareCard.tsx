@@ -28,6 +28,22 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState(false);
 
+  /**
+   * Convert a remote image URL to a base64 data URL via the server-side proxy.
+   * This avoids CORS errors when html-to-image tries to inline the avatar images.
+   */
+  async function proxyToDataUrl(src: string): Promise<string> {
+    const res = await fetch(`/api/proxy-image?url=${encodeURIComponent(src)}`);
+    if (!res.ok) throw new Error(`proxy ${res.status}`);
+    const blob = await res.blob();
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload  = () => resolve(reader.result as string);
+      reader.onerror = () => reject(new Error("FileReader failed"));
+      reader.readAsDataURL(blob);
+    });
+  }
+
   const handleDownload = useCallback(async () => {
     const el = cardRef.current;
     if (!el || isExporting) return;
@@ -35,22 +51,46 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
     setIsExporting(true);
     setExportError(false);
 
+    // Collect original srcs so we can restore them after export.
+    const imgs     = Array.from(el.querySelectorAll("img")) as HTMLImageElement[];
+    const origSrcs = imgs.map((img) => img.src);
+
     try {
-      // Dynamic import keeps html-to-image out of the initial JS bundle.
+      // ── Step 1: pre-fetch every avatar through our proxy → base64 ───────────
+      // html-to-image cannot load cross-origin images directly; converting them
+      // to data URLs first sidesteps CORS entirely.
+      await Promise.allSettled(
+        imgs.map(async (img, i) => {
+          try {
+            const dataUrl = await proxyToDataUrl(origSrcs[i]);
+            img.src = dataUrl;
+            // Wait for the browser to decode the new src before we capture.
+            await new Promise<void>((resolve) => {
+              if (img.complete && img.naturalWidth > 0) { resolve(); return; }
+              img.onload  = () => resolve();
+              img.onerror = () => resolve(); // still proceed on decode failure
+            });
+          } catch {
+            // Leave the original src — the capture will use the placeholder below.
+          }
+        }),
+      );
+
+      // ── Step 2: capture ───────────────────────────────────────────────────
       const { toPng } = await import("html-to-image");
 
-      // Scale so the exported PNG is exactly 1 200 px wide regardless of the
-      // card's rendered width on screen.
+      // pixelRatio scales the output so the PNG is exactly 1 200 px wide.
       const pixelRatio = Math.max(2, 1200 / el.offsetWidth);
 
       const dataUrl = await toPng(el, {
-        cacheBust: true,
+        cacheBust: false, // srcs are already data URLs — no further fetching needed
         pixelRatio,
-        // Transparent 1×1 placeholder for any avatar that fails CORS checks.
+        // Transparent placeholder for any image that still couldn't be resolved.
         imagePlaceholder:
           "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII=",
       });
 
+      // ── Step 3: trigger download ──────────────────────────────────────────
       const link = document.createElement("a");
       link.download = `followsignal-${username ?? "card"}.png`;
       link.href = dataUrl;
@@ -58,6 +98,8 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
     } catch {
       setExportError(true);
     } finally {
+      // ── Step 4: always restore original srcs so the live UI stays intact ──
+      imgs.forEach((img, i) => { img.src = origSrcs[i]; });
       setIsExporting(false);
     }
   }, [isExporting, username]);

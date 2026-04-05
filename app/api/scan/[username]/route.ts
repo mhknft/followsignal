@@ -202,23 +202,56 @@ interface SlotDef {
   tier:   Tier;
 }
 
-const SLOT_DEFS: SlotDef[] = [
-  { minGap:  100, maxGap:  250, tier: 1 }, // Slot 1: ~+175  above searched
-  { minGap:  250, maxGap:  450, tier: 1 }, // Slot 2: ~+350
-  { minGap:  450, maxGap:  700, tier: 2 }, // Slot 3: ~+575
-  { minGap:  700, maxGap: 1100, tier: 2 }, // Slot 4: ~+900
-  { minGap: 1100, maxGap: 1600, tier: 3 }, // Slot 5: ~+1 350
+// ─── Dynamic slot tables ──────────────────────────────────────────────────────
+//
+// Slot windows and widening passes are chosen based on the searched user's
+// Sorsa score so that large accounts (2 000+) can find nearby candidates
+// without needing huge score jumps that rarely exist in their follow graph.
+//
+// Standard  (score < 2 000) : gaps of +100 → +1 600 with aggressive widening.
+// High-tier (score ≥ 2 000) : tighter gaps of +25 → +500 so we only require
+//   accounts that are slightly stronger, matching realistic follow-graph density.
+
+/** Slot windows for accounts with score < 2 000. */
+const SLOT_DEFS_STANDARD: SlotDef[] = [
+  { minGap:  100, maxGap:  250, tier: 1 },
+  { minGap:  250, maxGap:  450, tier: 1 },
+  { minGap:  450, maxGap:  700, tier: 2 },
+  { minGap:  700, maxGap: 1100, tier: 2 },
+  { minGap: 1100, maxGap: 1600, tier: 3 },
 ];
 
-// Progressive widening applied when a slot's ideal window has no candidates.
-// Each pass multiplies [minGap, maxGap] by the lo/hi factors respectively.
-const WIDEN: Array<{ lo: number; hi: number }> = [
+/** Slot windows for accounts with score ≥ 2 000 (smaller gaps, easier to fill). */
+const SLOT_DEFS_HIGH: SlotDef[] = [
+  { minGap:  25, maxGap:  80,  tier: 1 },
+  { minGap:  80, maxGap: 130,  tier: 1 },
+  { minGap: 130, maxGap: 200,  tier: 2 },
+  { minGap: 200, maxGap: 300,  tier: 2 },
+  { minGap: 300, maxGap: 500,  tier: 3 },
+];
+
+/** Widening passes for standard accounts. */
+const WIDEN_STANDARD: Array<{ lo: number; hi: number }> = [
   { lo: 1.00, hi: 1.00 }, // Pass 0: exact window
   { lo: 0.75, hi: 1.40 }, // Pass 1: slightly wider
   { lo: 0.50, hi: 1.80 }, // Pass 2: noticeably wider
   { lo: 0.25, hi: 2.40 }, // Pass 3: quite wide
   { lo: 0.00, hi: 3.20 }, // Pass 4: very wide (floor = searched score)
   { lo: 0.00, hi: 8.00 }, // Pass 5: catch-all safety net
+];
+
+/**
+ * Widening passes for high-tier accounts (≥ 2 000).
+ * Starts tight, then expands: +25–80 → +12–320 → 0–600 → 0–2 000.
+ * The final pass floor (lo: 0.00) means we accept any score ≥ base, so
+ * even a same-score account qualifies as a last resort.
+ */
+const WIDEN_HIGH: Array<{ lo: number; hi: number }> = [
+  { lo: 1.00, hi: 1.00 }, // Pass 0: exact
+  { lo: 0.50, hi: 1.60 }, // Pass 1: half-gap lower, 60 % higher
+  { lo: 0.00, hi: 2.40 }, // Pass 2: floor = base (+0), ceiling = 2.4×
+  { lo: 0.00, hi: 5.00 }, // Pass 3: wide
+  { lo: 0.00, hi: 10.0 }, // Pass 4: catch-all
 ];
 
 /**
@@ -231,8 +264,9 @@ function findForSlot(
   used:     Set<string>,
   base:     number,
   def:      SlotDef,
+  widen:    Array<{ lo: number; hi: number }>,
 ): NormalisedAccount | null {
-  for (const { lo, hi } of WIDEN) {
+  for (const { lo, hi } of widen) {
     const minScore = base + def.minGap * lo;
     const maxScore = base + def.maxGap * hi;
 
@@ -249,18 +283,35 @@ function findForSlot(
  * Run the full eligibility filter + Pass A (slot-based) + Pass B (greedy)
  * on a cumulative scored pool.  Called once per expansion round; returns the
  * best ≤ 5 accounts found so far (sorted descending by score).
+ *
+ * Slot windows and widen passes are chosen dynamically:
+ *   • profileScore ≥ 2 000 → tighter HIGH slots so large accounts aren't left empty
+ *   • profileScore < 2 000 → standard wider slots
+ *
+ * Eligibility floor:
+ *   • score < 800   → recommendation must be ≥ 800
+ *   • 800–1 999     → recommendation must be > profileScore
+ *   • 2 000+        → recommendation must be ≥ profileScore (same score ok as last resort)
  */
 function fillSlots(
   allScored:    NormalisedAccount[],
   base:         number,
   profileScore: number,
 ): ScoredAccount[] {
+  const isHigh   = profileScore >= 2000;
+  const slotDefs = isHigh ? SLOT_DEFS_HIGH    : SLOT_DEFS_STANDARD;
+  const widen    = isHigh ? WIDEN_HIGH         : WIDEN_STANDARD;
+
+  // For high-score accounts we accept score >= profileScore (same score ok);
+  // for lower accounts we still require strictly greater.
+  const minEligible = isHigh ? profileScore : profileScore + 1;
+
   const seen = new Set<string>();
   const eligible = allScored
     .filter(isValid)
     .filter((c) => c.score > 0)
     .filter((c) => c.score >= 800)
-    .filter((c) => c.score > profileScore)
+    .filter((c) => c.score >= minEligible)
     .filter((c) => {
       const key = c.username.toLowerCase();
       if (seen.has(key)) return false;
@@ -272,8 +323,8 @@ function fillSlots(
   const pool: ScoredAccount[] = [];
 
   // Pass A: one candidate per slot, with progressive widening
-  for (const def of SLOT_DEFS) {
-    const found = findForSlot(eligible, used, base, def);
+  for (const def of slotDefs) {
+    const found = findForSlot(eligible, used, base, def, widen);
     if (found) {
       used.add(found.username);
       pool.push({ ...found, tier: def.tier });
