@@ -2,8 +2,7 @@
 
 import { motion } from "framer-motion";
 import Image from "next/image";
-import { getResults } from "../lib/getResults";
-import type { PredictedAccount } from "../types";
+import type { PredictedAccount, SearchedProfile } from "../types";
 
 function formatCount(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -20,10 +19,10 @@ function formatScore(n: number): string {
 interface ShareCardProps {
   username?: string;
   predictions: PredictedAccount[] | null;
+  searchedProfile?: SearchedProfile | null;
 }
 
-export default function ShareCard({ username, predictions }: ShareCardProps) {
-  const { profile } = getResults(username ?? "alexrivera");
+export default function ShareCard({ username: _username, predictions, searchedProfile }: ShareCardProps) {
   return (
     <section className="relative z-30 mt-24 mb-16 flex flex-col items-center px-6">
       {/* Section label */}
@@ -133,25 +132,39 @@ export default function ShareCard({ username, predictions }: ShareCardProps) {
                 }}
               >
                 <div
-                  className="rounded-full overflow-hidden flex-shrink-0"
+                  className="rounded-full overflow-hidden flex-shrink-0 flex items-center justify-center"
                   style={{
                     width: 40,
                     height: 40,
                     border: "2px solid rgba(168,85,247,0.5)",
                     boxShadow: "0 0 12px rgba(168,85,247,0.3)",
+                    background: "linear-gradient(135deg, #4c1d95, #1e1b4b)",
                   }}
                 >
-                  <Image
-                    src={profile.avatar}
-                    alt={profile.name}
-                    width={40}
-                    height={40}
-                    className="object-cover"
-                  />
+                  {searchedProfile?.avatar ? (
+                    <Image
+                      src={searchedProfile.avatar}
+                      alt={searchedProfile.displayName}
+                      width={40}
+                      height={40}
+                      className="object-cover w-full h-full"
+                      unoptimized
+                    />
+                  ) : searchedProfile ? (
+                    <span className="text-white/60 text-base font-black">
+                      {searchedProfile.displayName.charAt(0).toUpperCase()}
+                    </span>
+                  ) : (
+                    <div className="w-full h-full animate-pulse bg-white/[0.06]" />
+                  )}
                 </div>
                 <div>
-                  <div className="text-sm font-bold text-white">{profile.name}</div>
-                  <div className="text-xs text-purple-300/60">{profile.username}</div>
+                  <div className="text-sm font-bold text-white">
+                    {searchedProfile?.displayName ?? "—"}
+                  </div>
+                  <div className="text-xs text-purple-300/60">
+                    {searchedProfile ? `@${searchedProfile.username}` : ""}
+                  </div>
                 </div>
                 <div className="ml-auto text-right">
                   <div
@@ -162,7 +175,7 @@ export default function ShareCard({ username, predictions }: ShareCardProps) {
                       WebkitTextFillColor: "transparent",
                     }}
                   >
-                    {profile.orbitScore}
+                    {searchedProfile != null ? formatScore(searchedProfile.score) : "—"}
                   </div>
                   <div className="text-[9px] text-white/30 uppercase tracking-widest">
                     Orbit Score

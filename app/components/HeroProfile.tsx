@@ -3,18 +3,10 @@
 import { motion } from "framer-motion";
 import Image from "next/image";
 import OrbitScoreMeter from "./OrbitScoreMeter";
+import type { SearchedProfile } from "../types";
 
 interface HeroProfileProps {
-  user: {
-    name: string;
-    username: string;
-    avatar: string;
-    bio: string;
-    followers: number;
-    following: number;
-    orbitScore: number;
-    verified: boolean;
-  };
+  user: SearchedProfile;
 }
 
 function formatCount(n: number): string {
@@ -143,13 +135,24 @@ export default function HeroProfile({ user }: HeroProfileProps) {
               boxShadow: "0 0 0 2px rgba(0,0,0,0.6), 0 0 30px rgba(139,92,246,0.6)",
             }}
           >
-            <Image
-              src={user.avatar}
-              alt={user.name}
-              width={84}
-              height={84}
-              className="rounded-full object-cover"
-            />
+            {user.avatar ? (
+              <Image
+                src={user.avatar}
+                alt={user.displayName}
+                width={84}
+                height={84}
+                className="rounded-full object-cover"
+                unoptimized
+              />
+            ) : (
+              /* Neutral placeholder when no avatar available */
+              <div
+                className="w-full h-full rounded-full flex items-center justify-center text-white/40 text-2xl font-black"
+                style={{ background: "linear-gradient(135deg, #4c1d95, #1e1b4b)" }}
+              >
+                {user.displayName.charAt(0).toUpperCase()}
+              </div>
+            )}
           </div>
 
           {/* Verified badge */}
@@ -174,12 +177,12 @@ export default function HeroProfile({ user }: HeroProfileProps) {
           className="text-[22px] font-black text-white tracking-tight text-center leading-tight mb-0.5"
           style={{ textShadow: "0 0 40px rgba(192,132,252,0.6)" }}
         >
-          {user.name}
+          {user.displayName}
         </h1>
 
         {/* Username */}
         <span className="text-xs text-purple-300/70 mb-3 tracking-wider font-medium">
-          {user.username}
+          @{user.username}
         </span>
 
         {/* Bio */}
@@ -217,7 +220,7 @@ export default function HeroProfile({ user }: HeroProfileProps) {
         </div>
 
         {/* Orbit Score Meter */}
-        <OrbitScoreMeter score={user.orbitScore} />
+        <OrbitScoreMeter score={user.score} />
 
         {/* Scanning label */}
         <motion.div

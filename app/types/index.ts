@@ -38,3 +38,19 @@ export interface ScanResult {
   profile: UserProfile;
   predictions: PredictedAccount[];
 }
+
+/**
+ * The real profile of the searched user, fetched from Sorsa /info + /score.
+ * This is the single source of truth for the center card, loading screen,
+ * and share card. Never contains hardcoded or mock values.
+ */
+export interface SearchedProfile {
+  displayName: string;   // real display name or fallback to username
+  username: string;      // without @
+  avatar: string;        // https URL or empty string
+  bio: string;
+  followers: number;
+  following: number;
+  score: number;         // Sorsa score, minimum 800
+  verified: boolean;
+}

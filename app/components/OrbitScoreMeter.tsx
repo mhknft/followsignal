@@ -7,6 +7,11 @@ interface OrbitScoreMeterProps {
   score: number;
 }
 
+function formatOrbitScore(n: number): string {
+  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+  return Math.round(n).toString();
+}
+
 export default function OrbitScoreMeter({ score }: OrbitScoreMeterProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
@@ -95,7 +100,7 @@ export default function OrbitScoreMeter({ score }: OrbitScoreMeterProps) {
           animate={{ opacity: 1 }}
           transition={{ delay: 0.5 }}
         >
-          {score}
+          {formatOrbitScore(score)}
         </motion.span>
         <span className="text-[10px] tracking-widest text-purple-300 uppercase mt-0.5">
           Orbit Score

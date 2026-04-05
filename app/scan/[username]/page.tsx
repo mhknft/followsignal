@@ -1,59 +1,88 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import Background from "../../components/Background";
 import ParticleField from "../../components/ParticleField";
 import OrbitalScanner from "../../components/OrbitalScanner";
 import { generateDisplayName } from "../../data/generateProfile";
+import type { SearchedProfile } from "../../types";
 
 interface Props {
   params: Promise<{ username: string }>;
 }
 
-interface RealProfile {
-  name: string | null;
-  username: string;
-  avatar: string | null;
-}
-
+// Steps 0–4 are timer-driven; step 5 ("Finalizing…") is data-driven.
+// Durations are calibrated so the progress bar naturally hits the user-visible
+// stage percentages: 15 / 35 / 60 / 80 / 95 / 100.
 const STEPS = [
-  { label: "Reading profile data",             duration: 700  },
-  { label: "Mapping interaction graph",         duration: 900  },
-  { label: "Checking larger accounts in orbit", duration: 1000 },
-  { label: "Filtering existing followers",      duration: 800  },
-  { label: "Scoring realistic matches",         duration: 900  },
+  { label: "Profile identified",                duration: 800  }, // 0  → ~15 %
+  { label: "Reading profile data",              duration: 1100 }, // 15 → ~35 %
+  { label: "Mapping interaction graph",          duration: 1300 }, // 35 → ~60 %
+  { label: "Checking larger accounts in orbit",  duration: 1100 }, // 60 → ~80 %
+  { label: "Filtering follow-backs",             duration: 900  }, // 80 → ~95 %
+  { label: "Finalizing recommendations",         duration: 600  }, // 95 → 100 % (data-driven)
 ];
 
-const TOTAL = STEPS.reduce((s, x) => s + x.duration, 0); // ~4 400 ms
+// Sum of the five timed steps only (≈ 5 200 ms).
+const TIMED_TOTAL = STEPS.slice(0, 5).reduce((s, x) => s + x.duration, 0);
+
+// Absolute minimum scan duration in ms.  Even if the API is instant, the
+// loading screen is shown for at least this long to feel believable (5 s).
+const MIN_SCAN_MS = 5000;
 
 export default function ScanPage({ params }: Props) {
   const { username } = use(params);
   const router = useRouter();
 
-  // Fallback display name while real profile loads
   const fallbackName = generateDisplayName(username);
 
-  const [profile, setProfile] = useState<RealProfile | null>(null);
-  const [currentStep, setCurrentStep] = useState(0);
-  const [completedSteps, setCompletedSteps] = useState<number[]>([]);
-  const [elapsed, setElapsed] = useState(0);
+  // Record the moment the component mounts so we can enforce MIN_SCAN_MS.
+  const mountedAt = useRef(Date.now());
 
-  // Fetch real profile immediately — replaces fallback as soon as it arrives
+  const [profile,        setProfile]        = useState<SearchedProfile | null>(null);
+  const [currentStep,    setCurrentStep]     = useState(0);
+  const [completedSteps, setCompletedSteps]  = useState<number[]>([]);
+  const [elapsed,        setElapsed]         = useState(0);
+  const [dataReady,      setDataReady]       = useState(false);
+  const [scanError,      setScanError]       = useState(false);
+
+  // ── Profile fetch: fires immediately, resolves fast → avatar shows early ──────
+  // Decoupled from the scan so the user sees the real face during the loading
+  // animation without waiting for all 300 score lookups to complete.
   useEffect(() => {
     fetch(`/api/profile/${encodeURIComponent(username)}`)
-      .then((r) => r.json())
-      .then((data: RealProfile) => setProfile(data))
-      .catch(() => {/* keep fallback */});
+      .then((r) => (r.ok ? (r.json() as Promise<SearchedProfile>) : Promise.reject()))
+      .then((data) => setProfile(data))
+      .catch(() => {}); // graceful: fallback name + no avatar shown
   }, [username]);
 
-  // Step sequencer
+  // ── Scan fetch: drives navigation; enforces MIN_SCAN_MS floor ───────────────
+  // If the API responds faster than MIN_SCAN_MS we hold the loading screen until
+  // the minimum has elapsed, so the scan always feels substantive (≥ 5 s).
   useEffect(() => {
+    fetch(`/api/scan/${encodeURIComponent(username)}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`scan ${r.status}`);
+        return r.json();
+      })
+      .then(() => {
+        const elapsed  = Date.now() - mountedAt.current;
+        const holdFor  = Math.max(0, MIN_SCAN_MS - elapsed);
+        setTimeout(() => setDataReady(true), holdFor);
+      })
+      .catch(() => setScanError(true));
+  }, [username]);
+
+  // ── Step sequencer (steps 0–4, timer-based) ──────────────────────────────────
+  // Step 5 ("Finalizing recommendations") is completed by the data effect below.
+  useEffect(() => {
+    if (scanError) return;
     let step = 0;
 
     const next = () => {
-      if (step >= STEPS.length) return;
+      if (step >= 5) return; // stop before step 5 — that one is data-driven
       const { duration } = STEPS[step];
       setTimeout(() => {
         setCompletedSteps((prev) => [...prev, step]);
@@ -64,33 +93,77 @@ export default function ScanPage({ params }: Props) {
     };
 
     next();
-  }, []);
+  }, [scanError]);
 
-  // Progress ticker
+  // ── Complete step 5 once data is ready AND steps 0–4 have finished ───────────
   useEffect(() => {
+    if (!dataReady || currentStep < 5 || completedSteps.includes(5)) return;
+    setCompletedSteps((prev) => [...prev, 5]);
+    setCurrentStep(6);
+  }, [dataReady, currentStep, completedSteps]);
+
+  // ── Navigate as soon as step 5 is marked complete ────────────────────────────
+  useEffect(() => {
+    if (!completedSteps.includes(5) || scanError) return;
+    const t = setTimeout(() => router.push(`/results/${username}`), 500);
+    return () => clearTimeout(t);
+  }, [completedSteps, scanError, username, router]);
+
+  // ── Progress ticker (visual — tracks steps 0–3 timing) ───────────────────────
+  useEffect(() => {
+    if (scanError) return;
     const start = Date.now();
     const id = setInterval(() => {
       const ms = Date.now() - start;
-      setElapsed(Math.min(ms, TOTAL));
-      if (ms >= TOTAL) clearInterval(id);
+      setElapsed(Math.min(ms, TIMED_TOTAL));
+      if (ms >= TIMED_TOTAL) clearInterval(id);
     }, 30);
     return () => clearInterval(id);
-  }, []);
+  }, [scanError]);
 
-  // Navigate after all steps complete
-  useEffect(() => {
-    if (completedSteps.length === STEPS.length) {
-      const t = setTimeout(() => router.push(`/results/${username}`), 400);
-      return () => clearTimeout(t);
-    }
-  }, [completedSteps, username, router]);
+  // 0–95 % maps to the five timed steps; 100 % fires when step 5 (data-driven) completes.
+  const progress = dataReady ? 1.0 : Math.min(elapsed / TIMED_TOTAL, 1) * 0.95;
 
-  const progress = Math.min(elapsed / TOTAL, 1);
+  const displayName = profile?.displayName || fallbackName;
+  const avatarUrl   = profile?.avatar       || null;
 
-  // Use real data if available, fall back to generated name + no avatar
-  const displayName = profile?.name || fallbackName;
-  const avatarUrl   = profile?.avatar || null;
+  // ── Error state ───────────────────────────────────────────────────────────────
+  if (scanError) {
+    return (
+      <main className="relative min-h-screen bg-black overflow-hidden flex flex-col items-center justify-center">
+        <Background />
+        <ParticleField />
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+          className="relative z-20 flex flex-col items-center text-center px-6 gap-6"
+        >
+          <span className="text-4xl">⚠️</span>
+          <h1 className="text-xl font-bold text-white tracking-tight">Scan failed</h1>
+          <p className="text-sm text-white/40 max-w-xs leading-relaxed">
+            Could not reach the network for{" "}
+            <span className="text-purple-300/70 font-semibold">@{username}</span>. Check your
+            connection and try again.
+          </p>
+          <motion.button
+            whileHover={{ scale: 1.04 }}
+            whileTap={{ scale: 0.97 }}
+            onClick={() => router.push("/")}
+            className="px-7 py-3 rounded-xl text-sm font-semibold text-white"
+            style={{
+              background: "linear-gradient(135deg, #7c3aed, #4f46e5)",
+              boxShadow: "0 0 24px rgba(124,58,237,0.4), 0 2px 0 rgba(255,255,255,0.1) inset",
+            }}
+          >
+            Try another account
+          </motion.button>
+        </motion.div>
+      </main>
+    );
+  }
 
+  // ── Normal loading screen ─────────────────────────────────────────────────────
   return (
     <main className="relative min-h-screen bg-black overflow-hidden flex flex-col items-center justify-center">
       <Background />
@@ -150,7 +223,7 @@ export default function ScanPage({ params }: Props) {
           </span>
         </motion.div>
 
-        {/* Orbital scanner — avatar lives inside at the center */}
+        {/* Orbital scanner */}
         <motion.div
           initial={{ opacity: 0, scale: 0.85 }}
           animate={{ opacity: 1, scale: 1 }}
@@ -159,7 +232,7 @@ export default function ScanPage({ params }: Props) {
           <OrbitalScanner avatarUrl={avatarUrl} displayName={displayName} />
         </motion.div>
 
-        {/* Display name + handle below the scanner */}
+        {/* Display name + handle */}
         <motion.div
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
@@ -183,13 +256,13 @@ export default function ScanPage({ params }: Props) {
             className="w-full rounded-full overflow-hidden"
             style={{ height: 3, background: "rgba(139,92,246,0.12)" }}
           >
-            <motion.div
+            <div
               className="h-full rounded-full"
               style={{
                 width: `${progress * 100}%`,
                 background: "linear-gradient(90deg, #6d28d9, #a855f7, #e879f9)",
                 boxShadow: "0 0 10px rgba(168,85,247,0.6)",
-                transition: "width 0.1s linear",
+                transition: "width 0.15s linear",
               }}
             />
           </div>

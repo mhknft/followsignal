@@ -5,17 +5,16 @@ import { motion } from "framer-motion";
 import HeroProfile from "./HeroProfile";
 import ResultCard from "./ResultCard";
 import OrbitLines from "./OrbitLines";
-import { getResults } from "../lib/getResults";
-import type { PredictedAccount } from "../types";
+import type { PredictedAccount, SearchedProfile } from "../types";
 
 interface Props {
   username?: string;
   predictions: PredictedAccount[] | null; // null = loading
   hasError?: boolean;
+  searchedProfile?: SearchedProfile | null;
 }
 
-export default function ConstellationLayout({ username, predictions, hasError }: Props) {
-  const { profile } = getResults(username ?? "alexrivera");
+export default function ConstellationLayout({ username, predictions, hasError, searchedProfile }: Props) {
 
   const heroRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -80,7 +79,29 @@ export default function ConstellationLayout({ username, predictions, hasError }:
           className="absolute left-1/2 z-30"
           style={{ top: "28%", transform: "translate(-50%, -50%)" }}
         >
-          <HeroProfile user={profile} />
+          {searchedProfile ? (
+            <HeroProfile user={searchedProfile} />
+          ) : (
+            /* Loading skeleton for hero card */
+            <div
+              className="flex flex-col items-center px-8 pt-9 pb-7 rounded-3xl animate-pulse"
+              style={{
+                width: 290,
+                background: "linear-gradient(160deg, rgba(255,255,255,0.07) 0%, rgba(168,85,247,0.04) 100%)",
+                border: "1px solid rgba(168,85,247,0.2)",
+              }}
+            >
+              <div className="w-[84px] h-[84px] rounded-full bg-white/[0.06] mb-4" />
+              <div className="h-4 w-32 rounded bg-white/[0.08] mb-2" />
+              <div className="h-2.5 w-20 rounded bg-white/[0.05] mb-4" />
+              <div className="h-2 w-44 rounded bg-white/[0.04] mb-1" />
+              <div className="h-2 w-36 rounded bg-white/[0.04] mb-5" />
+              <div className="flex gap-2.5 w-full">
+                <div className="flex-1 h-12 rounded-xl bg-white/[0.04]" />
+                <div className="flex-1 h-12 rounded-xl bg-white/[0.04]" />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* ── LOADING STATE ── */}

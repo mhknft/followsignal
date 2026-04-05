@@ -6,7 +6,7 @@ import ParticleField from "../../components/ParticleField";
 import Navbar from "../../components/Navbar";
 import ConstellationLayout from "../../components/ConstellationLayout";
 import ShareCard from "../../components/ShareCard";
-import type { PredictedAccount } from "../../types";
+import type { PredictedAccount, SearchedProfile } from "../../types";
 
 interface Props {
   params: Promise<{ username: string }>;
@@ -17,23 +17,34 @@ export default function ResultsPage({ params }: Props) {
 
   const [predictions, setPredictions] = useState<PredictedAccount[] | null>(null);
   const [fetchError, setFetchError] = useState(false);
+  const [searchedProfile, setSearchedProfile] = useState<SearchedProfile | null>(null);
 
   useEffect(() => {
     setPredictions(null);
     setFetchError(false);
+    setSearchedProfile(null);
 
-    fetch(`/api/scan/${encodeURIComponent(username)}`)
-      .then((r) => {
+    // Fetch scan results and profile in parallel
+    Promise.allSettled([
+      fetch(`/api/scan/${encodeURIComponent(username)}`).then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then((data: { predictions: PredictedAccount[]; message?: string }) => {
-        setPredictions(data.predictions ?? []);
-      })
-      .catch(() => {
+        return r.json() as Promise<{ predictions: PredictedAccount[]; message?: string }>;
+      }),
+      fetch(`/api/profile/${encodeURIComponent(username)}`).then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json() as Promise<SearchedProfile>;
+      }),
+    ]).then(([scanResult, profileResult]) => {
+      if (scanResult.status === "fulfilled") {
+        setPredictions(scanResult.value.predictions ?? []);
+      } else {
         setFetchError(true);
         setPredictions([]);
-      });
+      }
+      if (profileResult.status === "fulfilled") {
+        setSearchedProfile(profileResult.value);
+      }
+    });
   }, [username]);
 
   return (
@@ -47,10 +58,11 @@ export default function ResultsPage({ params }: Props) {
           username={username}
           predictions={predictions}
           hasError={fetchError}
+          searchedProfile={searchedProfile}
         />
       </section>
 
-      <ShareCard username={username} predictions={predictions} />
+      <ShareCard username={username} predictions={predictions} searchedProfile={searchedProfile} />
 
       {/* Creator credit */}
       <div className="fixed bottom-5 right-6 z-50">

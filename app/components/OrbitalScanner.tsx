@@ -112,8 +112,8 @@ export default function OrbitalScanner({ avatarUrl, displayName }: Props) {
           transition={{ duration: 2.2, repeat: Infinity, ease: "easeOut" }}
           className="absolute rounded-full"
           style={{
-            width: avatarUrl ? 88 : 64,
-            height: avatarUrl ? 88 : 64,
+            width: avatarUrl ? 108 : 64,
+            height: avatarUrl ? 108 : 64,
             background: "radial-gradient(circle, rgba(168,85,247,0.5) 0%, transparent 70%)",
           }}
         />
@@ -123,8 +123,8 @@ export default function OrbitalScanner({ avatarUrl, displayName }: Props) {
           transition={{ duration: 1.8, repeat: Infinity, ease: "easeOut", delay: 0.4 }}
           className="absolute rounded-full"
           style={{
-            width: avatarUrl ? 72 : 44,
-            height: avatarUrl ? 72 : 44,
+            width: avatarUrl ? 88 : 44,
+            height: avatarUrl ? 88 : 44,
             border: "1px solid rgba(168,85,247,0.5)",
           }}
         />
@@ -135,51 +135,71 @@ export default function OrbitalScanner({ avatarUrl, displayName }: Props) {
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-            className="relative"
-            style={{ width: 68, height: 68 }}
+            className="relative flex items-center justify-center"
+            style={{ width: 84, height: 84 }}
           >
             {/* Avatar image */}
             <div
               className="relative rounded-full overflow-hidden"
               style={{
-                width: 68,
-                height: 68,
-                border: "2px solid rgba(168,85,247,0.5)",
-                boxShadow: "0 0 24px rgba(168,85,247,0.55), 0 0 8px rgba(168,85,247,0.3) inset",
+                width: 84,
+                height: 84,
+                border: "2.5px solid rgba(168,85,247,0.65)",
+                boxShadow:
+                  "0 0 32px rgba(168,85,247,0.7), 0 0 64px rgba(139,92,246,0.3), 0 0 8px rgba(168,85,247,0.4) inset",
               }}
             >
               <Image
                 src={avatarUrl}
                 alt={displayName ?? "profile"}
-                width={68}
-                height={68}
-                className="object-cover"
+                width={84}
+                height={84}
+                className="object-cover w-full h-full"
                 unoptimized
               />
 
-              {/* Soft light-sweep over avatar */}
+              {/* Soft light-sweep over avatar face */}
               <motion.div
                 className="absolute inset-0 rounded-full pointer-events-none"
                 animate={{ x: ["-100%", "200%"] }}
-                transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut", repeatDelay: 0.8 }}
+                transition={{ duration: 2.4, repeat: Infinity, ease: "easeInOut", repeatDelay: 1.2 }}
                 style={{
-                  background: "linear-gradient(105deg, transparent 30%, rgba(255,255,255,0.22) 50%, transparent 70%)",
+                  background:
+                    "linear-gradient(105deg, transparent 25%, rgba(255,255,255,0.28) 50%, transparent 75%)",
                 }}
               />
             </div>
 
-            {/* Rotating scan ring around avatar */}
+            {/* Fast-spin outer scan ring */}
             <motion.div
               animate={{ rotate: 360 }}
-              transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
+              transition={{ duration: 2.4, repeat: Infinity, ease: "linear" }}
               className="absolute inset-0 rounded-full pointer-events-none"
               style={{
-                width: 68,
-                height: 68,
-                background: "conic-gradient(from 0deg, rgba(168,85,247,0) 0%, rgba(168,85,247,0.7) 15%, rgba(168,85,247,0) 30%)",
-                borderRadius: "50%",
-                padding: 2,
-                WebkitMask: "radial-gradient(farthest-side, transparent calc(100% - 2px), white calc(100% - 2px))",
+                width: 84,
+                height: 84,
+                background:
+                  "conic-gradient(from 0deg, rgba(168,85,247,0) 0%, rgba(168,85,247,0.85) 18%, rgba(168,85,247,0) 36%)",
+                WebkitMask:
+                  "radial-gradient(farthest-side, transparent calc(100% - 2.5px), white calc(100% - 2.5px))",
+                mask: "radial-gradient(farthest-side, transparent calc(100% - 2.5px), white calc(100% - 2.5px))",
+              }}
+            />
+
+            {/* Slow counter-spin outer glow ring */}
+            <motion.div
+              animate={{ rotate: -360 }}
+              transition={{ duration: 6, repeat: Infinity, ease: "linear" }}
+              className="absolute rounded-full pointer-events-none"
+              style={{
+                width: 96,
+                height: 96,
+                top: -6,
+                left: -6,
+                background:
+                  "conic-gradient(from 180deg, rgba(139,92,246,0) 0%, rgba(168,85,247,0.45) 25%, rgba(139,92,246,0) 50%)",
+                WebkitMask:
+                  "radial-gradient(farthest-side, transparent calc(100% - 2px), white calc(100% - 2px))",
                 mask: "radial-gradient(farthest-side, transparent calc(100% - 2px), white calc(100% - 2px))",
               }}
             />
