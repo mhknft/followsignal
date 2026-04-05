@@ -53,7 +53,7 @@ export async function GET(
     const avatar = String(
       pick(src, "profileImageUrl", "profile_image_url", "profileImage",
            "profile_image", "avatar", "avatarUrl", "avatar_url", "photo") ?? "",
-    ).trim();
+    ).trim().replace(/^http:\/\//i, "https://");
 
     const rawUsername = String(
       pick(src, "username", "handle", "screen_name", "userName") ?? username,

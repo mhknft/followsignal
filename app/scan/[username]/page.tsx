@@ -3,7 +3,6 @@
 import { use, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import Image from "next/image";
 import Background from "../../components/Background";
 import ParticleField from "../../components/ParticleField";
 import OrbitalScanner from "../../components/OrbitalScanner";
@@ -151,50 +150,22 @@ export default function ScanPage({ params }: Props) {
           </span>
         </motion.div>
 
-        {/* Orbital scanner animation */}
+        {/* Orbital scanner — avatar lives inside at the center */}
         <motion.div
           initial={{ opacity: 0, scale: 0.85 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ duration: 0.9, delay: 0.2, ease: [0.16, 1, 0.3, 1] }}
         >
-          <OrbitalScanner />
+          <OrbitalScanner avatarUrl={avatarUrl} displayName={displayName} />
         </motion.div>
 
-        {/* Avatar + display name + handle */}
+        {/* Display name + handle below the scanner */}
         <motion.div
           initial={{ opacity: 0, y: 14 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.7, delay: 0.4 }}
-          className="flex flex-col items-center gap-2"
+          className="flex flex-col items-center gap-1"
         >
-          {/* Real avatar — fades in when loaded, hidden while null */}
-          <AnimatePresence>
-            {avatarUrl && (
-              <motion.div
-                key="avatar"
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-                className="rounded-full overflow-hidden"
-                style={{
-                  width: 56,
-                  height: 56,
-                  border: "2px solid rgba(168,85,247,0.45)",
-                  boxShadow: "0 0 18px rgba(168,85,247,0.35)",
-                }}
-              >
-                <Image
-                  src={avatarUrl}
-                  alt={displayName}
-                  width={56}
-                  height={56}
-                  className="object-cover"
-                  unoptimized
-                />
-              </motion.div>
-            )}
-          </AnimatePresence>
-
           <h1 className="text-2xl font-black text-white tracking-tight">
             {displayName}
           </h1>

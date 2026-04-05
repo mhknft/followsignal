@@ -2,8 +2,14 @@
 
 import { useEffect, useRef } from "react";
 import { motion } from "framer-motion";
+import Image from "next/image";
 
-export default function OrbitalScanner() {
+interface Props {
+  avatarUrl?: string | null;
+  displayName?: string;
+}
+
+export default function OrbitalScanner({ avatarUrl, displayName }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -28,7 +34,7 @@ export default function OrbitalScanner() {
       // ── Static orbit rings ──
       const rings = [
         { r: 110, opacity: 0.07 },
-        { r: 80,  opacity: 0.1 },
+        { r: 80,  opacity: 0.1  },
         { r: 52,  opacity: 0.14 },
       ];
       rings.forEach(({ r, opacity }) => {
@@ -41,7 +47,6 @@ export default function OrbitalScanner() {
 
       // ── Radar sweep ──
       const sweepLen = Math.PI * 0.9;
-      // Draw the sweep as a filled arc sector
       ctx.save();
       ctx.translate(cx, cy);
       ctx.rotate(angle);
@@ -88,8 +93,6 @@ export default function OrbitalScanner() {
       ctx.arc(dot2X, dot2Y, 1.8, 0, Math.PI * 2);
       ctx.fill();
 
-      // ── Center core pulse — drawn in CSS, skip here ──
-
       raf = requestAnimationFrame(draw);
     };
 
@@ -101,7 +104,7 @@ export default function OrbitalScanner() {
     <div className="relative flex items-center justify-center" style={{ width: 260, height: 260 }}>
       <canvas ref={canvasRef} className="absolute inset-0" />
 
-      {/* Center glowing core */}
+      {/* Center — avatar when available, FS icon fallback */}
       <div className="relative flex items-center justify-center">
         {/* Outer pulse halo */}
         <motion.div
@@ -109,8 +112,8 @@ export default function OrbitalScanner() {
           transition={{ duration: 2.2, repeat: Infinity, ease: "easeOut" }}
           className="absolute rounded-full"
           style={{
-            width: 64,
-            height: 64,
+            width: avatarUrl ? 88 : 64,
+            height: avatarUrl ? 88 : 64,
             background: "radial-gradient(circle, rgba(168,85,247,0.5) 0%, transparent 70%)",
           }}
         />
@@ -120,30 +123,87 @@ export default function OrbitalScanner() {
           transition={{ duration: 1.8, repeat: Infinity, ease: "easeOut", delay: 0.4 }}
           className="absolute rounded-full"
           style={{
-            width: 44,
-            height: 44,
+            width: avatarUrl ? 72 : 44,
+            height: avatarUrl ? 72 : 44,
             border: "1px solid rgba(168,85,247,0.5)",
           }}
         />
-        {/* Core */}
-        <motion.div
-          animate={{ scale: [1, 1.08, 1] }}
-          transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
-          className="relative w-8 h-8 rounded-full flex items-center justify-center"
-          style={{
-            background: "linear-gradient(135deg, #7c3aed, #4f46e5)",
-            boxShadow: "0 0 20px rgba(168,85,247,0.7), 0 0 40px rgba(139,92,246,0.3)",
-          }}
-        >
-          {/* FS icon */}
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <circle cx="7" cy="7" r="2" fill="white" />
-            <circle cx="7" cy="2.5" r="1" fill="rgba(255,255,255,0.7)" />
-            <circle cx="7" cy="11.5" r="1" fill="rgba(255,255,255,0.7)" />
-            <circle cx="2.5" cy="7" r="1" fill="rgba(255,255,255,0.7)" />
-            <circle cx="11.5" cy="7" r="1" fill="rgba(255,255,255,0.7)" />
-          </svg>
-        </motion.div>
+
+        {avatarUrl ? (
+          /* ── Real avatar with scanning ring ── */
+          <motion.div
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+            className="relative"
+            style={{ width: 68, height: 68 }}
+          >
+            {/* Avatar image */}
+            <div
+              className="relative rounded-full overflow-hidden"
+              style={{
+                width: 68,
+                height: 68,
+                border: "2px solid rgba(168,85,247,0.5)",
+                boxShadow: "0 0 24px rgba(168,85,247,0.55), 0 0 8px rgba(168,85,247,0.3) inset",
+              }}
+            >
+              <Image
+                src={avatarUrl}
+                alt={displayName ?? "profile"}
+                width={68}
+                height={68}
+                className="object-cover"
+                unoptimized
+              />
+
+              {/* Soft light-sweep over avatar */}
+              <motion.div
+                className="absolute inset-0 rounded-full pointer-events-none"
+                animate={{ x: ["-100%", "200%"] }}
+                transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut", repeatDelay: 0.8 }}
+                style={{
+                  background: "linear-gradient(105deg, transparent 30%, rgba(255,255,255,0.22) 50%, transparent 70%)",
+                }}
+              />
+            </div>
+
+            {/* Rotating scan ring around avatar */}
+            <motion.div
+              animate={{ rotate: 360 }}
+              transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
+              className="absolute inset-0 rounded-full pointer-events-none"
+              style={{
+                width: 68,
+                height: 68,
+                background: "conic-gradient(from 0deg, rgba(168,85,247,0) 0%, rgba(168,85,247,0.7) 15%, rgba(168,85,247,0) 30%)",
+                borderRadius: "50%",
+                padding: 2,
+                WebkitMask: "radial-gradient(farthest-side, transparent calc(100% - 2px), white calc(100% - 2px))",
+                mask: "radial-gradient(farthest-side, transparent calc(100% - 2px), white calc(100% - 2px))",
+              }}
+            />
+          </motion.div>
+        ) : (
+          /* ── FS icon fallback while avatar loads ── */
+          <motion.div
+            animate={{ scale: [1, 1.08, 1] }}
+            transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+            className="relative w-8 h-8 rounded-full flex items-center justify-center"
+            style={{
+              background: "linear-gradient(135deg, #7c3aed, #4f46e5)",
+              boxShadow: "0 0 20px rgba(168,85,247,0.7), 0 0 40px rgba(139,92,246,0.3)",
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <circle cx="7" cy="7" r="2" fill="white" />
+              <circle cx="7" cy="2.5" r="1" fill="rgba(255,255,255,0.7)" />
+              <circle cx="7" cy="11.5" r="1" fill="rgba(255,255,255,0.7)" />
+              <circle cx="2.5" cy="7" r="1" fill="rgba(255,255,255,0.7)" />
+              <circle cx="11.5" cy="7" r="1" fill="rgba(255,255,255,0.7)" />
+            </svg>
+          </motion.div>
+        )}
       </div>
     </div>
   );
