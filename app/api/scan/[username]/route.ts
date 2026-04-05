@@ -245,6 +245,56 @@ function findForSlot(
   return null;
 }
 
+/**
+ * Run the full eligibility filter + Pass A (slot-based) + Pass B (greedy)
+ * on a cumulative scored pool.  Called once per expansion round; returns the
+ * best ≤ 5 accounts found so far (sorted descending by score).
+ */
+function fillSlots(
+  allScored:    NormalisedAccount[],
+  base:         number,
+  profileScore: number,
+): ScoredAccount[] {
+  const seen = new Set<string>();
+  const eligible = allScored
+    .filter(isValid)
+    .filter((c) => c.score > 0)
+    .filter((c) => c.score >= 800)
+    .filter((c) => c.score > profileScore)
+    .filter((c) => {
+      const key = c.username.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  const used = new Set<string>();
+  const pool: ScoredAccount[] = [];
+
+  // Pass A: one candidate per slot, with progressive widening
+  for (const def of SLOT_DEFS) {
+    const found = findForSlot(eligible, used, base, def);
+    if (found) {
+      used.add(found.username);
+      pool.push({ ...found, tier: def.tier });
+    }
+  }
+
+  // Pass B: fill any remaining positions with the lowest-score leftovers
+  if (pool.length < 5) {
+    const remaining = eligible
+      .filter((c) => !used.has(c.username))
+      .sort((a, b) => a.score - b.score);
+    for (const c of remaining) {
+      if (pool.length >= 5) break;
+      used.add(c.username);
+      pool.push({ ...c, tier: 3 });
+    }
+  }
+
+  return pool.sort((a, b) => b.score - a.score).slice(0, 5);
+}
+
 // ─── Category label (tier + follower count) ──────────────────────────────────
 
 function categoryFromTier(tier: Tier, followers: number): string {
@@ -374,108 +424,83 @@ export async function GET(
     console.log(`  Total non-followbacks  : ${nonFollowbacks.length}`);
     console.log(`  (following ${following.length} - ${following.length - nonFollowbacks.length} mutual = ${nonFollowbacks.length} candidates)`);
 
-    // ── 5. Sort by followers_count, take top 1 000 ───────────────────────────
-    // Apply username blacklist + org-detection heuristic BEFORE scoring so we
-    // don't waste API calls on brands, foundations, exchanges, or protocols.
-    const top1000 = [...nonFollowbacks]
+    // ── 5. Pre-filter candidates (blacklist + org heuristic) then sort ────────
+    // Done once before any scoring so we never burn API calls on excluded accounts.
+    const base = Math.max(profileScore, 800);
+    const candidateList = [...nonFollowbacks]
       .filter((acc) => !BLOCKED_USERNAMES.has(acc.username.toLowerCase()))
       .filter((acc) => !looksLikeOrg(acc.name, acc.username))
-      .sort((a, b) => b.followers - a.followers)
-      .slice(0, 1000);
+      .sort((a, b) => b.followers - a.followers);
 
-    console.log(`\n[scan] Fetching Sorsa scores for ${top1000.length} candidates...`);
+    console.log(`  Candidate list (after filters) : ${candidateList.length}`);
 
-    // ── 6. Parallel score lookup for top 1 000 ───────────────────────────────
-    const scores = await Promise.all(top1000.map((acc) => fetchScore(acc.username)));
-
-    const withScores: NormalisedAccount[] = top1000.map((acc, i) => ({
-      ...acc,
-      score: scores[i],
-    }));
-
-    const nonZeroCount = withScores.filter((c) => c.score > 0).length;
-    console.log(`  Candidates scored      : ${nonZeroCount} (non-zero out of ${top1000.length})`);
-
-    // ── 7. Base eligibility + deduplication ───────────────────────────────────
+    // ── 6. Multi-round scoring: keep expanding until 5 results are found ──────
     //
-    // Hard requirements before any slot logic:
-    //   • valid username, finite non-zero score
-    //   • score >= 800 (absolute floor)
-    //   • score strictly > profileScore (never recommend weaker-than-searched)
-    //   • unique username
+    // Round 1 : score top 1 000 by followers count.
+    // Round 2 : score the next 1 000 if < 5 found after round 1.
+    // Round 3 : score the next 1 000 (up to 3 000 total) as a last resort.
+    //
+    // Each round appends to allScored then re-runs fillSlots() on the full
+    // cumulative pool.  The loading screen stays visible naturally while
+    // rounds 2–3 execute — we never navigate until we have 5 confirmed cards.
 
-    const seen = new Set<string>();
-    const eligible = withScores
+    const ROUND_SIZE = 1000;
+    const MAX_ROUNDS = 3;
+
+    let allScored:   NormalisedAccount[] = [];
+    let filtered:    ScoredAccount[]     = [];
+    let totalNonZero = 0;
+    let exhausted    = false;
+
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const batch = candidateList.slice(round * ROUND_SIZE, (round + 1) * ROUND_SIZE);
+      if (batch.length === 0) { exhausted = true; break; }
+
+      console.log(`\n[scan] Round ${round + 1}: scoring ${batch.length} candidates (offset ${round * ROUND_SIZE})…`);
+
+      const batchScores = await Promise.all(batch.map((acc) => fetchScore(acc.username)));
+      const batchScored  = batch.map((acc, i) => ({ ...acc, score: batchScores[i] }));
+      allScored    = [...allScored, ...batchScored];
+      totalNonZero = allScored.filter((c) => c.score > 0).length;
+
+      filtered = fillSlots(allScored, base, profileScore);
+      console.log(`  After round ${round + 1}: ${filtered.length} result(s) / ${totalNonZero} non-zero scores`);
+
+      if (filtered.length >= 5) break;
+      if (round < MAX_ROUNDS - 1) {
+        console.log(`  < 5 results — expanding to round ${round + 2}…`);
+      }
+    }
+
+    if (!exhausted && filtered.length < 5) exhausted = true;
+
+    // ── 7. Debug summary ──────────────────────────────────────────────────────
+    const seenLog = new Set<string>();
+    const eligibleCount = allScored
       .filter(isValid)
       .filter((c) => c.score > 0)
       .filter((c) => c.score >= 800)
       .filter((c) => c.score > profileScore)
       .filter((c) => {
-        const key = c.username.toLowerCase();
-        if (seen.has(key)) return false;
-        seen.add(key);
+        const k = c.username.toLowerCase();
+        if (seenLog.has(k)) return false;
+        seenLog.add(k);
         return true;
-      });
+      }).length;
 
-    // ── 8. Slot-based spread fill ─────────────────────────────────────────────
-    //
-    // Pass A: attempt to fill each of the 5 explicit slots (with widening).
-    //   One candidate per slot → natural upward progression.
-    //
-    // Pass B: any slots still empty after Pass A are filled greedily with the
-    //   next available eligible candidates (ascending by score).
-    //   This is the safety net that ensures we always try to return 5 cards.
-
-    const base      = Math.max(profileScore, 800);
-    const usedNames = new Set<string>();
-    const finalPool: ScoredAccount[] = [];
-
-    // Pass A
-    const slotLog: string[] = [];
-    for (const def of SLOT_DEFS) {
-      const found = findForSlot(eligible, usedNames, base, def);
-      if (found) {
-        usedNames.add(found.username);
-        finalPool.push({ ...found, tier: def.tier });
-        slotLog.push(`✓ score=${Math.round(found.score)}`);
-      } else {
-        slotLog.push("✗ empty");
-      }
-    }
-
-    // Pass B: fill remaining positions with leftover eligible candidates
-    const passACount = finalPool.length;
-    if (finalPool.length < 5) {
-      const remaining = eligible
-        .filter((c) => !usedNames.has(c.username))
-        .sort((a, b) => a.score - b.score);
-
-      for (const c of remaining) {
-        if (finalPool.length >= 5) break;
-        usedNames.add(c.username);
-        finalPool.push({ ...c, tier: 3 });
-      }
-    }
-
-    const filtered = [...finalPool].sort((a, b) => b.score - a.score).slice(0, 5);
-
-    // ── Debug summary ─────────────────────────────────────────────────────────
     const tierCounts = { 1: 0, 2: 0, 3: 0 };
-    finalPool.forEach((c) => tierCounts[c.tier]++);
+    filtered.forEach((c) => tierCounts[c.tier]++);
 
-    console.log(`\n[scan] ════ DEBUG SUMMARY ════`);
-    console.log(`  Searched username      : @${username}`);
-    console.log(`  Searched profile score : ${profileScore}  (base=${base})`);
-    console.log(`  Total following        : ${following.length}`);
-    console.log(`  Total followers        : ${followers.length}`);
-    console.log(`  Total non-followbacks  : ${nonFollowbacks.length}`);
-    console.log(`  Total candidates scored: ${nonZeroCount}`);
-    console.log(`  Eligible (base filter) : ${eligible.length}`);
-    console.log(`  Pass A — slot results:`);
-    SLOT_DEFS.forEach((def, i) => {
-      console.log(`    Slot ${i + 1} [base+${def.minGap}, base+${def.maxGap})  tier=${def.tier}  →  ${slotLog[i]}`);
-    });
-    console.log(`  Pass B — filled ${finalPool.length - passACount} extra slot(s) from leftover pool`);
+    console.log(`\n[scan] ════ FINAL SUMMARY ════`);
+    console.log(`  Searched username         : @${username}`);
+    console.log(`  Searched profile score    : ${profileScore}  (base=${base})`);
+    console.log(`  Total following           : ${following.length}`);
+    console.log(`  Total followers           : ${followers.length}`);
+    console.log(`  Total non-followbacks     : ${nonFollowbacks.length}`);
+    console.log(`  Candidate list (filtered) : ${candidateList.length}`);
+    console.log(`  Total candidates scored   : ${allScored.length} (${totalNonZero} non-zero)`);
+    console.log(`  Eligible (base filter)    : ${eligibleCount}`);
+    console.log(`  Exhausted pool            : ${exhausted}`);
     console.log(`  Tier 1: ${tierCounts[1]}  Tier 2: ${tierCounts[2]}  Tier 3: ${tierCounts[3]}`);
     console.log(`\n[scan] FINAL RESULTS (${filtered.length}):`);
     filtered.forEach((c, i) => {
@@ -489,6 +514,7 @@ export async function GET(
     if (filtered.length === 0) {
       return NextResponse.json({
         predictions: [],
+        exhausted: true,
         message: "No stronger non-followback matches found",
       });
     }
@@ -515,11 +541,11 @@ export async function GET(
       };
     });
 
-    return NextResponse.json({ predictions });
+    return NextResponse.json({ predictions, exhausted });
   } catch (err) {
     console.error("[/api/scan] fatal error:", err);
     return NextResponse.json(
-      { predictions: [], message: "No stronger non-followback matches found", error: String(err) },
+      { predictions: [], exhausted: true, message: "No stronger non-followback matches found", error: String(err) },
       { status: 500 },
     );
   }

@@ -47,6 +47,8 @@ export default function ScanPage({ params }: Props) {
   const [elapsed,        setElapsed]         = useState(0);
   const [dataReady,      setDataReady]       = useState(false);
   const [scanError,      setScanError]       = useState(false);
+  // True once step 5 has been waiting > 2 s without data — shows "Still searching…"
+  const [waitingForData, setWaitingForData]  = useState(false);
 
   // ── Profile fetch: fires immediately, resolves fast → avatar shows early ──────
   // Decoupled from the scan so the user sees the real face during the loading
@@ -59,18 +61,26 @@ export default function ScanPage({ params }: Props) {
   }, [username]);
 
   // ── Scan fetch: drives navigation; enforces MIN_SCAN_MS floor ───────────────
-  // If the API responds faster than MIN_SCAN_MS we hold the loading screen until
-  // the minimum has elapsed, so the scan always feels substantive (≥ 5 s).
+  // Only sets dataReady once we have 5 confirmed predictions OR the backend
+  // signals it has exhausted all realistic candidates (exhausted: true).
+  // The backend now does up to 3 scoring rounds automatically, so the API
+  // response itself may take 15–20 s for accounts with sparse follow graphs.
   useEffect(() => {
     fetch(`/api/scan/${encodeURIComponent(username)}`)
       .then((r) => {
         if (!r.ok) throw new Error(`scan ${r.status}`);
-        return r.json();
+        return r.json() as Promise<{ predictions?: unknown[]; exhausted?: boolean }>;
       })
-      .then(() => {
-        const elapsed  = Date.now() - mountedAt.current;
-        const holdFor  = Math.max(0, MIN_SCAN_MS - elapsed);
-        setTimeout(() => setDataReady(true), holdFor);
+      .then((data) => {
+        const count  = Array.isArray(data?.predictions) ? data.predictions.length : 0;
+        const isDone = count >= 5 || data?.exhausted === true;
+
+        const elapsedMs = Date.now() - mountedAt.current;
+        const holdFor   = Math.max(0, MIN_SCAN_MS - elapsedMs);
+
+        // If somehow the backend returns < 5 without exhausted (shouldn't happen),
+        // wait an extra 3 s then accept whatever we have as a fallback.
+        setTimeout(() => setDataReady(true), isDone ? holdFor : holdFor + 3000);
       })
       .catch(() => setScanError(true));
   }, [username]);
@@ -94,6 +104,15 @@ export default function ScanPage({ params }: Props) {
 
     next();
   }, [scanError]);
+
+  // ── Show "Still searching…" after 2 s of waiting on step 5 ─────────────────
+  // Fires once the 5 timed steps are done but data hasn't arrived yet, giving
+  // the user a believable signal that we're running extra rounds of scoring.
+  useEffect(() => {
+    if (currentStep < 5 || dataReady) return;
+    const t = setTimeout(() => setWaitingForData(true), 2000);
+    return () => clearTimeout(t);
+  }, [currentStep, dataReady]);
 
   // ── Complete step 5 once data is ready AND steps 0–4 have finished ───────────
   useEffect(() => {
@@ -357,6 +376,33 @@ export default function ScanPage({ params }: Props) {
             );
           })}
         </motion.div>
+
+        {/* "Still searching…" banner — shown when round 2/3 scoring is running */}
+        <AnimatePresence>
+          {waitingForData && !dataReady && (
+            <motion.div
+              key="still-searching"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.5 }}
+              className="flex items-center gap-2.5"
+            >
+              <motion.span
+                animate={{ scale: [1, 1.5, 1], opacity: [0.5, 1, 0.5] }}
+                transition={{ duration: 1.4, repeat: Infinity }}
+                className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+                style={{ background: "rgba(168,85,247,1)", boxShadow: "0 0 8px rgba(168,85,247,0.8)" }}
+              />
+              <span
+                className="text-[11px] tracking-widest uppercase"
+                style={{ color: "rgba(192,132,252,0.75)" }}
+              >
+                Still searching for stronger matches…
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Done state */}
         <AnimatePresence>
