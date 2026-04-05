@@ -118,40 +118,73 @@ function isValid(acc: NormalisedAccount): boolean {
 
 // ─── Relevance filter ─────────────────────────────────────────────────────────
 //
-// Removes obvious brand / org / protocol / celebrity accounts so only
-// individual creators, traders, and CT personalities appear as recommendations.
+// Five-tier filter removes brand, product, org, bot, and non-personal accounts
+// so only individual creators, traders, and CT personalities reach the final
+// ranking.  All comparisons are lowercase.  Applied BEFORE scoring so no API
+// quota is spent on excluded candidates.
 
-/** Hard-blocked usernames — always excluded regardless of score. */
+// ── Tier 1: exact username block ─────────────────────────────────────────────
 const BLOCKED_USERNAMES = new Set([
-  "claude",
-  "anthropic",
-  "ethereum",
-  "ethereumfoundation",
-  "ethereumfndn",
-  "openai",
-  "google",
-  "tesla",
-  "openclaw",
-  "xdevelopers",
-  "binance",
-  "coinbase",
+  // AI / tech companies
+  "claude", "anthropic", "openai", "google", "tesla", "microsoft", "apple",
+  "meta", "amazon", "nvidia", "perplexity", "perplexityai",
+  // Messaging / platforms
+  "discord", "telegram", "whatsapp", "signal", "slack", "zoom",
+  // Crypto infrastructure
+  "ethereum", "ethereumfoundation", "ethereumfndn",
+  "solana", "avalanche", "polkadot", "cardano", "tron", "algorand",
+  "near", "aptos", "sui", "stellar", "ripple", "litecoin",
+  // CEXs
+  "binance", "coinbase", "kraken", "okx", "bybit", "kucoin", "bitget",
+  "gateio", "huobi", "mexc", "bitfinex", "bitmex",
+  // Wallets / DeFi
+  "metamask", "phantom", "rabby", "rainbow", "trustwallet", "ledger",
+  "uniswap", "aave", "compound", "curve", "gmx", "dydx", "synthetix",
+  "opensea", "blur", "rarible", "looksrare",
+  // Data / tooling
+  "coinmarketcap", "coingecko", "defillama", "dune", "nansen",
+  // Twitter / X infra
+  "openclaw", "xdevelopers", "twitterdev",
 ]);
 
-/**
- * Display-name tokens that strongly indicate an organisation, brand, protocol,
- * exchange, or non-personal account.
- */
+// ── Tier 2: username substring block ─────────────────────────────────────────
+// If the username CONTAINS any of these the account is a brand or product.
+const BLOCKED_USERNAME_SUBSTRINGS = [
+  "discord", "telegram", "metamask", "perplexi",
+  "uniswap", "airdrop", "official_", "_official",
+  "wallet", "exchange", "protocol", "foundation",
+  "defi", "nftmarket",
+];
+
+// ── Tier 3: display-name substring block ─────────────────────────────────────
+// If the full display name CONTAINS any of these strings (as a substring) it
+// is almost certainly a product / brand account.
+const BLOCKED_DISPLAY_NAME_SUBSTRINGS = [
+  "discord", "telegram", "perplexity", "metamask",
+  "phantom wallet", "trust wallet",
+];
+
+// ── Tier 4: display-name token block ─────────────────────────────────────────
+// Individual WORDS in the display name that indicate an org or product.
 const ORG_NAME_TOKENS = new Set([
-  "foundation", "protocol", "official", "exchange",
+  // Legal / corporate
+  "foundation", "official", "exchange",
   "labs", "lab", "capital", "ventures", "venture",
-  "fund", "inc", "llc", "ltd", "corp", "dao",
+  "fund", "inc", "llc", "ltd", "corp",
   "association", "organization", "org", "society",
   "federation", "alliance", "coalition", "collective",
-  "institute", "media", "news", "team", "group",
-  "magazine", "journal", "network",
+  "institute", "media", "news", "magazine", "journal",
+  // Crypto / web3 org types
+  "dao", "protocol", "defi", "dex", "yield", "swap",
+  // Generic non-personal
+  "team", "group", "network",
+  // App / bot signals
+  "bot", "app",
+  // Specific brands appearing as tokens
+  "discord", "telegram", "wallet",
 ]);
 
-/** Username suffix patterns that indicate org / project accounts. */
+// ── Tier 5: username suffix regex ────────────────────────────────────────────
 const ORG_USERNAME_RE = [
   /foundation$/i,
   /official$/i,
@@ -162,21 +195,41 @@ const ORG_USERNAME_RE = [
   /labs?$/i,
   /capital$/i,
   /ventures?$/i,
+  /bot$/i,
 ];
 
 /**
- * Returns true when a candidate looks like an organisation, brand, exchange,
- * or protocol rather than an individual person.
+ * Returns true when the account should be EXCLUDED from recommendations.
+ * Runs all five tiers in order; returns false (keep) only if none match.
  */
-function looksLikeOrg(name: string, username: string): boolean {
-  // Split display name on whitespace and common punctuation
-  const tokens = name.toLowerCase().split(/[\s\-_.,&|/\\()\[\]+]+/);
+function isFiltered(name: string, username: string): boolean {
+  const uLow = username.toLowerCase();
+  const nLow = name.toLowerCase();
+
+  // T1 — exact username
+  if (BLOCKED_USERNAMES.has(uLow)) return true;
+
+  // T2 — username substring
+  for (const sub of BLOCKED_USERNAME_SUBSTRINGS) {
+    if (uLow.includes(sub)) return true;
+  }
+
+  // T3 — display-name substring
+  for (const sub of BLOCKED_DISPLAY_NAME_SUBSTRINGS) {
+    if (nLow.includes(sub)) return true;
+  }
+
+  // T4 — display-name token
+  const tokens = nLow.split(/[\s\-_.,&|/\\()\[\]+:]+/);
   for (const token of tokens) {
     if (token && ORG_NAME_TOKENS.has(token)) return true;
   }
+
+  // T5 — username suffix pattern
   for (const re of ORG_USERNAME_RE) {
-    if (re.test(username)) return true;
+    if (re.test(uLow)) return true;
   }
+
   return false;
 }
 
@@ -280,18 +333,21 @@ function findForSlot(
 }
 
 /**
- * Run the full eligibility filter + Pass A (slot-based) + Pass B (greedy)
- * on a cumulative scored pool.  Called once per expansion round; returns the
- * best ≤ 5 accounts found so far (sorted descending by score).
+ * Run eligibility filter + Pass A (slot-based) + Pass B (greedy same-tier) +
+ * Pass C (last-resort any scored human account ≥ 800) on a cumulative scored
+ * pool.  Called once per expansion round; returns the best ≤ 5 accounts found
+ * so far (sorted descending by score).
  *
- * Slot windows and widen passes are chosen dynamically:
- *   • profileScore ≥ 2 000 → tighter HIGH slots so large accounts aren't left empty
- *   • profileScore < 2 000 → standard wider slots
+ * Pass priority:
+ *   A — slot-based with progressive widening (prefers accounts above profileScore)
+ *   B — greedy fill from accounts still above the primary eligibility floor
+ *   C — absolute last resort: any valid scored account ≥ 800, sorted desc by score.
+ *       Triggered only when A+B still can't reach 5, so we never show fewer cards
+ *       than are genuinely available in the user's follow graph.
  *
- * Eligibility floor:
- *   • score < 800   → recommendation must be ≥ 800
- *   • 800–1 999     → recommendation must be > profileScore
- *   • 2 000+        → recommendation must be ≥ profileScore (same score ok as last resort)
+ * Slot/widen tables:
+ *   profileScore ≥ 2 000 → HIGH (tighter gaps, matches dense large-account graphs)
+ *   profileScore < 2 000 → STANDARD
  */
 function fillSlots(
   allScored:    NormalisedAccount[],
@@ -299,30 +355,31 @@ function fillSlots(
   profileScore: number,
 ): ScoredAccount[] {
   const isHigh   = profileScore >= 2000;
-  const slotDefs = isHigh ? SLOT_DEFS_HIGH    : SLOT_DEFS_STANDARD;
-  const widen    = isHigh ? WIDEN_HIGH         : WIDEN_STANDARD;
+  const slotDefs = isHigh ? SLOT_DEFS_HIGH  : SLOT_DEFS_STANDARD;
+  const widen    = isHigh ? WIDEN_HIGH       : WIDEN_STANDARD;
 
-  // For high-score accounts we accept score >= profileScore (same score ok);
-  // for lower accounts we still require strictly greater.
+  // Primary eligibility: score must be above (or equal for isHigh) profileScore.
   const minEligible = isHigh ? profileScore : profileScore + 1;
 
-  const seen = new Set<string>();
+  const dedupSeen = new Set<string>();
+  function dedup(c: NormalisedAccount): boolean {
+    const k = c.username.toLowerCase();
+    if (dedupSeen.has(k)) return false;
+    dedupSeen.add(k);
+    return true;
+  }
+
   const eligible = allScored
     .filter(isValid)
     .filter((c) => c.score > 0)
     .filter((c) => c.score >= 800)
     .filter((c) => c.score >= minEligible)
-    .filter((c) => {
-      const key = c.username.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    .filter(dedup);
 
   const used = new Set<string>();
   const pool: ScoredAccount[] = [];
 
-  // Pass A: one candidate per slot, with progressive widening
+  // ── Pass A: one candidate per slot with progressive widening ─────────────
   for (const def of slotDefs) {
     const found = findForSlot(eligible, used, base, def, widen);
     if (found) {
@@ -331,12 +388,35 @@ function fillSlots(
     }
   }
 
-  // Pass B: fill any remaining positions with the lowest-score leftovers
+  // ── Pass B: greedy fill from leftover eligible (ascending score) ──────────
   if (pool.length < 5) {
     const remaining = eligible
       .filter((c) => !used.has(c.username))
       .sort((a, b) => a.score - b.score);
     for (const c of remaining) {
+      if (pool.length >= 5) break;
+      used.add(c.username);
+      pool.push({ ...c, tier: 3 });
+    }
+  }
+
+  // ── Pass C: last resort — any valid scored human account ≥ 800 ───────────
+  // Reaches accounts that are at or below profileScore.  Sorted descending so
+  // we always surface the highest-quality leftovers first.
+  if (pool.length < 5) {
+    const seenC = new Set<string>();
+    const lastResort = allScored
+      .filter(isValid)
+      .filter((c) => c.score > 0)
+      .filter((c) => c.score >= 800)
+      .filter((c) => {
+        const k = c.username.toLowerCase();
+        if (used.has(k) || seenC.has(k)) return false;
+        seenC.add(k);
+        return true;
+      })
+      .sort((a, b) => b.score - a.score); // highest score first as fallback
+    for (const c of lastResort) {
       if (pool.length >= 5) break;
       used.add(c.username);
       pool.push({ ...c, tier: 3 });
@@ -475,27 +555,30 @@ export async function GET(
     console.log(`  Total non-followbacks  : ${nonFollowbacks.length}`);
     console.log(`  (following ${following.length} - ${following.length - nonFollowbacks.length} mutual = ${nonFollowbacks.length} candidates)`);
 
-    // ── 5. Pre-filter candidates (blacklist + org heuristic) then sort ────────
-    // Done once before any scoring so we never burn API calls on excluded accounts.
+    // ── 5. Pre-filter candidates (5-tier relevance filter) then sort ──────────
+    // Runs once before any scoring so we never burn API quota on brand/org/bot
+    // accounts.  Sort by followers desc so we score the most prominent accounts
+    // first — they are most likely to have a Sorsa score available.
     const base = Math.max(profileScore, 800);
     const candidateList = [...nonFollowbacks]
-      .filter((acc) => !BLOCKED_USERNAMES.has(acc.username.toLowerCase()))
-      .filter((acc) => !looksLikeOrg(acc.name, acc.username))
+      .filter((acc) => !isFiltered(acc.name, acc.username))
       .sort((a, b) => b.followers - a.followers);
 
-    console.log(`  Candidate list (after filters) : ${candidateList.length}`);
+    const excludedCount = nonFollowbacks.length - candidateList.length;
+    console.log(`  Excluded by relevance filter   : ${excludedCount}`);
+    console.log(`  Human candidates remaining     : ${candidateList.length}`);
 
     // ── 6. Multi-round scoring: keep expanding until 5 results are found ──────
     //
-    // Round 1 : score top 1 000 by followers count.
-    // Round 2 : score the next 1 000 if < 5 found after round 1.
-    // Round 3 : score the next 1 000 (up to 3 000 total) as a last resort.
+    // Round 1 : score top 1 500 human candidates by followers count.
+    // Round 2 : score the next 1 500 if < 5 found after round 1.
+    // Round 3 : score the next 1 500 (up to 4 500 total) as a last resort.
     //
-    // Each round appends to allScored then re-runs fillSlots() on the full
-    // cumulative pool.  The loading screen stays visible naturally while
-    // rounds 2–3 execute — we never navigate until we have 5 confirmed cards.
+    // Each round appends to allScored and re-runs fillSlots() on the full
+    // cumulative pool (Pass A slot-fill → Pass B greedy → Pass C last-resort).
+    // The loading screen stays up naturally while rounds 2–3 execute.
 
-    const ROUND_SIZE = 1000;
+    const ROUND_SIZE = 1500;
     const MAX_ROUNDS = 3;
 
     let allScored:   NormalisedAccount[] = [];
@@ -526,12 +609,13 @@ export async function GET(
     if (!exhausted && filtered.length < 5) exhausted = true;
 
     // ── 7. Debug summary ──────────────────────────────────────────────────────
-    const seenLog = new Set<string>();
+    const seenLog  = new Set<string>();
+    const minEl    = profileScore >= 2000 ? profileScore : profileScore + 1;
     const eligibleCount = allScored
       .filter(isValid)
       .filter((c) => c.score > 0)
       .filter((c) => c.score >= 800)
-      .filter((c) => c.score > profileScore)
+      .filter((c) => c.score >= minEl)
       .filter((c) => {
         const k = c.username.toLowerCase();
         if (seenLog.has(k)) return false;
@@ -543,15 +627,16 @@ export async function GET(
     filtered.forEach((c) => tierCounts[c.tier]++);
 
     console.log(`\n[scan] ════ FINAL SUMMARY ════`);
-    console.log(`  Searched username         : @${username}`);
-    console.log(`  Searched profile score    : ${profileScore}  (base=${base})`);
-    console.log(`  Total following           : ${following.length}`);
-    console.log(`  Total followers           : ${followers.length}`);
-    console.log(`  Total non-followbacks     : ${nonFollowbacks.length}`);
-    console.log(`  Candidate list (filtered) : ${candidateList.length}`);
-    console.log(`  Total candidates scored   : ${allScored.length} (${totalNonZero} non-zero)`);
-    console.log(`  Eligible (base filter)    : ${eligibleCount}`);
-    console.log(`  Exhausted pool            : ${exhausted}`);
+    console.log(`  Searched username              : @${username}`);
+    console.log(`  Searched profile score         : ${profileScore}  (base=${base})`);
+    console.log(`  Total following                : ${following.length}`);
+    console.log(`  Total followers                : ${followers.length}`);
+    console.log(`  Total non-followbacks          : ${nonFollowbacks.length}`);
+    console.log(`  Excluded by relevance filter   : ${excludedCount}`);
+    console.log(`  Human candidates remaining     : ${candidateList.length}`);
+    console.log(`  Total candidates scored        : ${allScored.length} (${totalNonZero} non-zero)`);
+    console.log(`  Eligible (primary floor)       : ${eligibleCount}`);
+    console.log(`  Exhausted pool                 : ${exhausted}`);
     console.log(`  Tier 1: ${tierCounts[1]}  Tier 2: ${tierCounts[2]}  Tier 3: ${tierCounts[3]}`);
     console.log(`\n[scan] FINAL RESULTS (${filtered.length}):`);
     filtered.forEach((c, i) => {
