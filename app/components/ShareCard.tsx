@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import Image from "next/image";
 import type { PredictedAccount, SearchedProfile } from "../types";
@@ -13,7 +14,7 @@ function formatCount(n: number): string {
 function formatScore(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1000) return (n / 1000).toFixed(1) + "K";
-  return n.toString();
+  return Math.round(n).toString(); // never expose raw floats (e.g. 634.019 → 634)
 }
 
 interface ShareCardProps {
@@ -22,7 +23,45 @@ interface ShareCardProps {
   searchedProfile?: SearchedProfile | null;
 }
 
-export default function ShareCard({ username: _username, predictions, searchedProfile }: ShareCardProps) {
+export default function ShareCard({ username, predictions, searchedProfile }: ShareCardProps) {
+  const cardRef  = useRef<HTMLDivElement>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportError, setExportError] = useState(false);
+
+  const handleDownload = useCallback(async () => {
+    const el = cardRef.current;
+    if (!el || isExporting) return;
+
+    setIsExporting(true);
+    setExportError(false);
+
+    try {
+      // Dynamic import keeps html-to-image out of the initial JS bundle.
+      const { toPng } = await import("html-to-image");
+
+      // Scale so the exported PNG is exactly 1 200 px wide regardless of the
+      // card's rendered width on screen.
+      const pixelRatio = Math.max(2, 1200 / el.offsetWidth);
+
+      const dataUrl = await toPng(el, {
+        cacheBust: true,
+        pixelRatio,
+        // Transparent 1×1 placeholder for any avatar that fails CORS checks.
+        imagePlaceholder:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII=",
+      });
+
+      const link = document.createElement("a");
+      link.download = `followsignal-${username ?? "card"}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch {
+      setExportError(true);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [isExporting, username]);
+
   return (
     <section className="relative z-30 mt-24 mb-16 flex flex-col items-center px-6">
       {/* Section label */}
@@ -77,8 +116,9 @@ export default function ShareCard({ username: _username, predictions, searchedPr
               "0 8px 48px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04) inset",
           }}
         >
-          {/* The actual share card */}
+          {/* The actual share card — this element is captured for export */}
           <div
+            ref={cardRef}
             className="relative overflow-hidden rounded-xl"
             style={{
               width: 520,
@@ -295,13 +335,19 @@ export default function ShareCard({ username: _username, predictions, searchedPr
         className="flex flex-col items-center gap-3"
       >
         <motion.button
-          whileHover={{ scale: 1.04 }}
-          whileTap={{ scale: 0.97 }}
+          onClick={handleDownload}
+          disabled={isExporting || predictions === null}
+          whileHover={isExporting || predictions === null ? {} : { scale: 1.04 }}
+          whileTap={isExporting || predictions === null ? {} : { scale: 0.97 }}
           className="relative px-10 py-4 rounded-2xl font-bold text-sm tracking-wide text-white overflow-hidden group"
           style={{
-            background: "linear-gradient(135deg, #7c3aed 0%, #6d28d9 50%, #4f46e5 100%)",
+            background: isExporting
+              ? "linear-gradient(135deg, #4c1d95 0%, #3730a3 100%)"
+              : "linear-gradient(135deg, #7c3aed 0%, #6d28d9 50%, #4f46e5 100%)",
             boxShadow:
               "0 0 0 1px rgba(168,85,247,0.3), 0 8px 32px rgba(109,40,217,0.4), 0 2px 0 rgba(255,255,255,0.1) inset",
+            opacity: predictions === null ? 0.45 : 1,
+            cursor: isExporting || predictions === null ? "default" : "pointer",
           }}
         >
           {/* Button shine */}
@@ -313,18 +359,48 @@ export default function ShareCard({ username: _username, predictions, searchedPr
             }}
           />
           <span className="relative flex items-center gap-2">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path
-                d="M8 1v9m0 0L5 7m3 3l3-3M2 12v1a1 1 0 001 1h10a1 1 0 001-1v-1"
-                stroke="white"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-            Download Share Card
+            {isExporting ? (
+              <>
+                {/* Spinner */}
+                <motion.span
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 0.9, repeat: Infinity, ease: "linear" }}
+                  className="inline-block w-4 h-4 rounded-full border-2"
+                  style={{
+                    borderColor: "rgba(255,255,255,0.2)",
+                    borderTopColor: "rgba(255,255,255,0.9)",
+                  }}
+                />
+                Preparing image…
+              </>
+            ) : (
+              <>
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <path
+                    d="M8 1v9m0 0L5 7m3 3l3-3M2 12v1a1 1 0 001 1h10a1 1 0 001-1v-1"
+                    stroke="white"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                Download Share Card
+              </>
+            )}
           </span>
         </motion.button>
+
+        {/* Error message */}
+        {exportError && (
+          <motion.p
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="text-[11px] tracking-wide text-center"
+            style={{ color: "rgba(248,113,113,0.8)" }}
+          >
+            Could not generate image. Please try again.
+          </motion.p>
+        )}
 
         <p className="text-[11px] text-white/30 tracking-wide">
           Optimized for X · 1200 × 630px
