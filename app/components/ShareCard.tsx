@@ -3,6 +3,7 @@
 import { motion } from "framer-motion";
 import Image from "next/image";
 import { getResults } from "../lib/getResults";
+import type { PredictedAccount } from "../types";
 
 function formatCount(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -10,8 +11,19 @@ function formatCount(n: number): string {
   return n.toString();
 }
 
-export default function ShareCard({ username }: { username?: string }) {
-  const { profile, predictions } = getResults(username ?? "alexrivera");
+function formatScore(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+  return n.toString();
+}
+
+interface ShareCardProps {
+  username?: string;
+  predictions: PredictedAccount[] | null;
+}
+
+export default function ShareCard({ username, predictions }: ShareCardProps) {
+  const { profile } = getResults(username ?? "alexrivera");
   return (
     <section className="relative z-30 mt-24 mb-16 flex flex-col items-center px-6">
       {/* Section label */}
@@ -163,60 +175,84 @@ export default function ShareCard({ username }: { username?: string }) {
                 Top Predicted Followers
               </div>
 
-              {/* 5 accounts compact list */}
-              <div className="flex flex-col gap-2">
-                {predictions.map((acc, i) => (
-                  <div key={acc.id} className="flex items-center gap-3">
-                    <span className="text-[10px] text-white/20 w-4 text-right flex-shrink-0">
-                      {i + 1}
-                    </span>
-                    <div
-                      className="rounded-full overflow-hidden flex-shrink-0"
-                      style={{ width: 28, height: 28, border: "1px solid rgba(139,92,246,0.25)" }}
-                    >
-                      <Image
-                        src={acc.avatar}
-                        alt={acc.name}
-                        width={28}
-                        height={28}
-                        className="object-cover"
-                      />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-xs font-semibold text-white truncate">
-                        {acc.name}
+              {/* Account list — loading skeleton, empty state, or real rows */}
+              {predictions === null ? (
+                <div className="flex flex-col gap-2">
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <div key={n} className="flex items-center gap-3 animate-pulse">
+                      <div className="w-4" />
+                      <div className="w-7 h-7 rounded-full bg-white/5 flex-shrink-0" />
+                      <div className="flex-1 flex flex-col gap-1">
+                        <div className="h-2.5 rounded bg-white/[0.08] w-2/3" />
+                        <div className="h-2 rounded bg-white/5 w-1/2" />
                       </div>
-                      <div className="text-[10px] text-white/30 truncate">
-                        {acc.username} · {formatCount(acc.followers)} followers
-                      </div>
+                      <div className="w-10 h-3 rounded bg-purple-500/15" />
                     </div>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      {acc.isWildcard && (
+                  ))}
+                </div>
+              ) : predictions.length === 0 ? (
+                <div className="flex flex-col items-center gap-2 py-4">
+                  <span className="text-lg">🔭</span>
+                  <p className="text-[10px] text-white/30 text-center tracking-wide">
+                    No stronger matches found above your current orbit score
+                  </p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {predictions.map((acc, i) => (
+                    <div key={acc.id} className="flex items-center gap-3">
+                      <span className="text-[10px] text-white/20 w-4 text-right flex-shrink-0">
+                        {i + 1}
+                      </span>
+                      <div
+                        className="rounded-full overflow-hidden flex-shrink-0"
+                        style={{ width: 28, height: 28, border: "1px solid rgba(139,92,246,0.25)" }}
+                      >
+                        <Image
+                          src={acc.avatar}
+                          alt={acc.name}
+                          width={28}
+                          height={28}
+                          className="object-cover"
+                          unoptimized
+                        />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs font-semibold text-white truncate">
+                          {acc.name}
+                        </div>
+                        <div className="text-[10px] text-white/30 truncate">
+                          {acc.username} · {formatCount(acc.followers)} followers
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {acc.isWildcard && (
+                          <span
+                            className="text-[8px] px-1.5 py-0.5 rounded-full tracking-widest uppercase"
+                            style={{
+                              background: "rgba(168,85,247,0.25)",
+                              border: "1px solid rgba(168,85,247,0.4)",
+                              color: "rgba(220,180,255,0.9)",
+                            }}
+                          >
+                            Rare
+                          </span>
+                        )}
                         <span
-                          className="text-[8px] px-1.5 py-0.5 rounded-full tracking-widest uppercase"
+                          className="text-xs font-black"
                           style={{
-                            background: "rgba(168,85,247,0.25)",
-                            border: "1px solid rgba(168,85,247,0.4)",
-                            color: "rgba(220,180,255,0.9)",
+                            background: "linear-gradient(135deg, #c084fc, #818cf8)",
+                            WebkitBackgroundClip: "text",
+                            WebkitTextFillColor: "transparent",
                           }}
                         >
-                          Rare
+                          {acc.score != null ? formatScore(acc.score) : `${acc.matchPercent}%`}
                         </span>
-                      )}
-                      <span
-                        className="text-xs font-black"
-                        style={{
-                          background: "linear-gradient(135deg, #c084fc, #818cf8)",
-                          WebkitBackgroundClip: "text",
-                          WebkitTextFillColor: "transparent",
-                        }}
-                      >
-                        {acc.matchPercent}%
-                      </span>
+                      </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ))}
+                </div>
+              )}
 
               {/* Footer */}
               <div className="flex items-center justify-between mt-5 pt-4" style={{ borderTop: "1px solid rgba(139,92,246,0.1)" }}>

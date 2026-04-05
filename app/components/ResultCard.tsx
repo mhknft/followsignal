@@ -15,6 +15,13 @@ function formatCount(n: number): string {
   return n.toString();
 }
 
+/** Format a raw Sorsa score for card display: 2400 → "2.4K", 850 → "850" */
+function formatScore(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1000)      return (n / 1000).toFixed(1) + "K";
+  return n.toString();
+}
+
 // Unique purple-family accent per card index
 const cardAccents = [
   { primary: "rgba(139,92,246,",  glow: "rgba(139,92,246,",   border: "rgba(139,92,246,0.28)",  barFrom: "#6d28d9", barTo: "#a855f7" },
@@ -185,11 +192,11 @@ export default function ResultCard({ account, index }: ResultCardProps) {
             </div>
           </div>
 
-          {/* ── Match percentage ── */}
+          {/* ── Score / Match percentage ── */}
           <div className="flex items-end justify-between mb-3">
             <div className="flex flex-col">
               <span className="text-[9px] text-white/25 uppercase tracking-widest mb-0.5">
-                Match
+                {account.score != null ? "Score" : "Match"}
               </span>
               <motion.span
                 className="font-black leading-none"
@@ -206,7 +213,7 @@ export default function ResultCard({ account, index }: ResultCardProps) {
                 animate={{ opacity: 1 }}
                 transition={{ delay: pos.delay + 0.5 }}
               >
-                {account.matchPercent}%
+                {account.score != null ? formatScore(account.score) : `${account.matchPercent}%`}
               </motion.span>
             </div>
 

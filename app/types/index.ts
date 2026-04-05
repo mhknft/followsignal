@@ -25,7 +25,8 @@ export interface PredictedAccount {
   avatar: string;
   followers: number;
   category: string;
-  matchPercent: number; // 0–100
+  matchPercent: number; // 0–100, used for bar width normalisation
+  score?: number;       // Raw Sorsa score (displayed instead of matchPercent% when present)
   reason: string;
   isWildcard: boolean;
   /** Layout hint used by ConstellationLayout */
