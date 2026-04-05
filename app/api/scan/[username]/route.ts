@@ -130,6 +130,10 @@ const BLOCKED_USERNAMES = new Set([
   "meta", "amazon", "nvidia", "perplexity", "perplexityai",
   // Messaging / platforms
   "discord", "telegram", "whatsapp", "signal", "slack", "zoom",
+  // Professional / social platforms
+  "linkedin", "moltbook",
+  // Twitter / X platform features
+  "premium", "xpremium", "x_premium", "verified",
   // Crypto infrastructure
   "ethereum", "ethereumfoundation", "ethereumfndn",
   "solana", "avalanche", "polkadot", "cardano", "tron", "algorand",
@@ -162,6 +166,9 @@ const BLOCKED_USERNAME_SUBSTRINGS = [
 const BLOCKED_DISPLAY_NAME_SUBSTRINGS = [
   "discord", "telegram", "perplexity", "metamask",
   "phantom wallet", "trust wallet",
+  "linkedin", "moltbook",
+  "x premium", "x corp", "x safety", "openai",
+  "ethereum foundation",
 ];
 
 // ── Tier 4: display-name token block ─────────────────────────────────────────
@@ -182,6 +189,8 @@ const ORG_NAME_TOKENS = new Set([
   "bot", "app",
   // Specific brands appearing as tokens
   "discord", "telegram", "wallet",
+  // Platform features that appear as standalone words
+  "premium", "linkedin", "moltbook",
 ]);
 
 // ── Tier 5: username suffix regex ────────────────────────────────────────────
@@ -198,11 +207,31 @@ const ORG_USERNAME_RE = [
   /bot$/i,
 ];
 
+// ── Tier 6: generic brand / platform heuristic ───────────────────────────────
+// Catches product accounts that didn't match any explicit list.
+// Two signals, either of which is sufficient to exclude:
+//   A. Display name is exactly two words and the first word is "X"
+//      (e.g. "X Premium", "X Corp", "X Safety" — Twitter/X product accounts).
+//   B. Display name is a single word AND the account has ≥ 500 K followers.
+//      Real CT personalities at that scale almost always have multi-word names;
+//      single-word 500K+ accounts are virtually always platforms or features.
+function looksLikeGenericBrand(name: string, followers: number): boolean {
+  const words = name.trim().split(/\s+/).filter((w) => w.length > 0);
+
+  // Signal A — "X <Anything>" two-word product names
+  if (words.length === 2 && words[0] === "X") return true;
+
+  // Signal B — single-word name with massive following
+  if (words.length === 1 && followers >= 500_000) return true;
+
+  return false;
+}
+
 /**
  * Returns true when the account should be EXCLUDED from recommendations.
- * Runs all five tiers in order; returns false (keep) only if none match.
+ * Runs all six tiers in order; returns false (keep) only if none match.
  */
-function isFiltered(name: string, username: string): boolean {
+function isFiltered(name: string, username: string, followers = 0): boolean {
   const uLow = username.toLowerCase();
   const nLow = name.toLowerCase();
 
@@ -229,6 +258,9 @@ function isFiltered(name: string, username: string): boolean {
   for (const re of ORG_USERNAME_RE) {
     if (re.test(uLow)) return true;
   }
+
+  // T6 — generic brand / platform heuristic
+  if (looksLikeGenericBrand(name, followers)) return true;
 
   return false;
 }
@@ -561,7 +593,7 @@ export async function GET(
     // first — they are most likely to have a Sorsa score available.
     const base = Math.max(profileScore, 800);
     const candidateList = [...nonFollowbacks]
-      .filter((acc) => !isFiltered(acc.name, acc.username))
+      .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
       .sort((a, b) => b.followers - a.followers);
 
     const excludedCount = nonFollowbacks.length - candidateList.length;
