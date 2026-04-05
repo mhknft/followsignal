@@ -116,39 +116,69 @@ function isValid(acc: NormalisedAccount): boolean {
   return acc.username.length > 0 && !isNaN(acc.score) && isFinite(acc.score);
 }
 
-// ─── Score-gap ranges ─────────────────────────────────────────────────────────
+// ─── Score slots ─────────────────────────────────────────────────────────────
 //
-// Five ordered ranges of score gaps relative to the searched user's score.
-// Slots are filled from the closest (smallest gap) range first, then gradually
-// widened — so a searched user with score 800 gets recommendations like
-// 900 · 1 100 · 1 300 · 1 700 · 2 200  rather than jumping straight to 3 500+.
+// Five explicitly defined score-gap slots, each targeting ONE candidate.
+// The best candidate (smallest gap from the searched user) within each slot's
+// window is selected, producing a natural upward progression such as:
+//   800 → 950 → 1 100 → 1 400 → 1 800 → 2 200
 //
-// Each range maps to a display tier (1-3) that drives category labels.
+// If a slot's ideal window is empty, findForSlot() tries six progressively wider
+// passes before giving up.  After all slots have been attempted (Pass A), any
+// remaining positions are filled greedily from leftover eligible candidates
+// sorted by score ascending (Pass B) — so we always try as hard as possible
+// to reach 5 cards.
 
-type Tier        = 1 | 2 | 3;
+type Tier          = 1 | 2 | 3;
 type ScoredAccount = NormalisedAccount & { tier: Tier };
 
-interface ScoreGapRange {
-  minGap: number;   // candidate must be at least (base + minGap)
-  maxGap: number;   // candidate must be below (base + maxGap)  [Infinity = no cap]
+interface SlotDef {
+  minGap: number; // lower bound relative to searched score (inclusive)
+  maxGap: number; // upper bound relative to searched score (exclusive)
   tier:   Tier;
 }
 
-function getGapRanges(profileScore: number): ScoreGapRange[] {
-  // Use a floor of 800 when the /score call fails (profileScore = 0).
-  const base = Math.max(profileScore, 800);
-  return [
-    { minGap:    0, maxGap:  300, tier: 1 }, // R1: +0  → +300  above base  (closest)
-    { minGap:  300, maxGap:  500, tier: 1 }, // R2: +300 → +500
-    { minGap:  500, maxGap: 1000, tier: 2 }, // R3: +500 → +1 000
-    { minGap: 1000, maxGap: 1500, tier: 2 }, // R4: +1 000 → +1 500
-    { minGap: 1500, maxGap: Infinity, tier: 3 }, // R5: 1 500+ above base   (last resort)
-  ].map((r) => ({
-    ...r,
-    // Translate relative gaps into absolute score bounds.
-    min: base + r.minGap,
-    max: r.maxGap === Infinity ? Infinity : base + r.maxGap,
-  })) as (ScoreGapRange & { min: number; max: number })[];
+const SLOT_DEFS: SlotDef[] = [
+  { minGap:  100, maxGap:  250, tier: 1 }, // Slot 1: ~+175  above searched
+  { minGap:  250, maxGap:  450, tier: 1 }, // Slot 2: ~+350
+  { minGap:  450, maxGap:  700, tier: 2 }, // Slot 3: ~+575
+  { minGap:  700, maxGap: 1100, tier: 2 }, // Slot 4: ~+900
+  { minGap: 1100, maxGap: 1600, tier: 3 }, // Slot 5: ~+1 350
+];
+
+// Progressive widening applied when a slot's ideal window has no candidates.
+// Each pass multiplies [minGap, maxGap] by the lo/hi factors respectively.
+const WIDEN: Array<{ lo: number; hi: number }> = [
+  { lo: 1.00, hi: 1.00 }, // Pass 0: exact window
+  { lo: 0.75, hi: 1.40 }, // Pass 1: slightly wider
+  { lo: 0.50, hi: 1.80 }, // Pass 2: noticeably wider
+  { lo: 0.25, hi: 2.40 }, // Pass 3: quite wide
+  { lo: 0.00, hi: 3.20 }, // Pass 4: very wide (floor = searched score)
+  { lo: 0.00, hi: 8.00 }, // Pass 5: catch-all safety net
+];
+
+/**
+ * Find the single best candidate for one slot.
+ * "Best" = lowest score in window (smallest gap → most natural progression).
+ * Returns null if every widening pass also comes up empty.
+ */
+function findForSlot(
+  eligible: NormalisedAccount[],
+  used:     Set<string>,
+  base:     number,
+  def:      SlotDef,
+): NormalisedAccount | null {
+  for (const { lo, hi } of WIDEN) {
+    const minScore = base + def.minGap * lo;
+    const maxScore = base + def.maxGap * hi;
+
+    const hit = eligible
+      .filter((c) => !used.has(c.username) && c.score >= minScore && c.score < maxScore)
+      .sort((a, b) => a.score - b.score)[0]; // ascending → pick smallest gap
+
+    if (hit) return hit;
+  }
+  return null;
 }
 
 // ─── Category label (tier + follower count) ──────────────────────────────────
@@ -280,33 +310,33 @@ export async function GET(
     console.log(`  Total non-followbacks  : ${nonFollowbacks.length}`);
     console.log(`  (following ${following.length} - ${following.length - nonFollowbacks.length} mutual = ${nonFollowbacks.length} candidates)`);
 
-    // ── 5. Sort by followers_count, take top 300 ─────────────────────────────
-    // Larger pool means more candidates to score, giving the tiered windows a
-    // better chance to fill all 5 slots for users with many mutual follows.
-    const top300 = [...nonFollowbacks]
+    // ── 5. Sort by followers_count, take top 1 000 ───────────────────────────
+    // Large pool ensures we always have enough scored candidates to fill all
+    // five slots, even for accounts with many mutual follows.
+    const top1000 = [...nonFollowbacks]
       .sort((a, b) => b.followers - a.followers)
-      .slice(0, 300);
+      .slice(0, 1000);
 
-    console.log(`\n[scan] Fetching Sorsa scores for ${top300.length} candidates...`);
+    console.log(`\n[scan] Fetching Sorsa scores for ${top1000.length} candidates...`);
 
-    // ── 6. Parallel score lookup for top 300 ─────────────────────────────────
-    const scores = await Promise.all(top300.map((acc) => fetchScore(acc.username)));
+    // ── 6. Parallel score lookup for top 1 000 ───────────────────────────────
+    const scores = await Promise.all(top1000.map((acc) => fetchScore(acc.username)));
 
-    const withScores: NormalisedAccount[] = top300.map((acc, i) => ({
+    const withScores: NormalisedAccount[] = top1000.map((acc, i) => ({
       ...acc,
       score: scores[i],
     }));
 
     const nonZeroCount = withScores.filter((c) => c.score > 0).length;
-    console.log(`  Candidates scored      : ${nonZeroCount} (non-zero scores out of ${top300.length} fetched)`);
+    console.log(`  Candidates scored      : ${nonZeroCount} (non-zero out of ${top1000.length})`);
 
     // ── 7. Base eligibility + deduplication ───────────────────────────────────
     //
-    // Every candidate must satisfy ALL of these before entering any range:
+    // Hard requirements before any slot logic:
     //   • valid username, finite non-zero score
     //   • score >= 800 (absolute floor)
     //   • score strictly > profileScore (never recommend weaker-than-searched)
-    //   • unique username (first occurrence wins)
+    //   • unique username
 
     const seen = new Set<string>();
     const eligible = withScores
@@ -321,40 +351,47 @@ export async function GET(
         return true;
       });
 
-    // ── 8. Range-gap waterfall fill ───────────────────────────────────────────
+    // ── 8. Slot-based spread fill ─────────────────────────────────────────────
     //
-    // Fill 5 slots starting from the closest score-gap range, widening outward
-    // only when a nearer range can't supply enough candidates.  Within each range,
-    // candidates are sorted ascending so the smallest gaps appear first, giving
-    // gradual score progressions (e.g. 900 · 1100 · 1300 · 1700 · 2200).
+    // Pass A: attempt to fill each of the 5 explicit slots (with widening).
+    //   One candidate per slot → natural upward progression.
+    //
+    // Pass B: any slots still empty after Pass A are filled greedily with the
+    //   next available eligible candidates (ascending by score).
+    //   This is the safety net that ensures we always try to return 5 cards.
 
-    const ranges = getGapRanges(profileScore) as (ScoreGapRange & { min: number; max: number })[];
-    const SLOTS  = 5;
-
+    const base      = Math.max(profileScore, 800);
+    const usedNames = new Set<string>();
     const finalPool: ScoredAccount[] = [];
-    const usedNames = new Set<string>(); // safety guard across ranges
 
-    const rangeCounts: number[] = [];
-
-    for (const range of ranges) {
-      if (finalPool.length >= SLOTS) break;
-
-      const inRange = eligible
-        .filter((c) => c.score >= range.min && c.score < range.max && !usedNames.has(c.username))
-        .sort((a, b) => a.score - b.score); // ascending: closest gap first
-
-      const needed = SLOTS - finalPool.length;
-      const taken  = inRange.slice(0, needed);
-
-      taken.forEach((c) => {
-        usedNames.add(c.username);
-        finalPool.push({ ...c, tier: range.tier });
-      });
-      rangeCounts.push(taken.length);
+    // Pass A
+    const slotLog: string[] = [];
+    for (const def of SLOT_DEFS) {
+      const found = findForSlot(eligible, usedNames, base, def);
+      if (found) {
+        usedNames.add(found.username);
+        finalPool.push({ ...found, tier: def.tier });
+        slotLog.push(`✓ score=${Math.round(found.score)}`);
+      } else {
+        slotLog.push("✗ empty");
+      }
     }
 
-    // Final output sorted by score desc (highest = wildcard card)
-    const filtered = [...finalPool].sort((a, b) => b.score - a.score).slice(0, SLOTS);
+    // Pass B: fill remaining positions with leftover eligible candidates
+    const passACount = finalPool.length;
+    if (finalPool.length < 5) {
+      const remaining = eligible
+        .filter((c) => !usedNames.has(c.username))
+        .sort((a, b) => a.score - b.score);
+
+      for (const c of remaining) {
+        if (finalPool.length >= 5) break;
+        usedNames.add(c.username);
+        finalPool.push({ ...c, tier: 3 });
+      }
+    }
+
+    const filtered = [...finalPool].sort((a, b) => b.score - a.score).slice(0, 5);
 
     // ── Debug summary ─────────────────────────────────────────────────────────
     const tierCounts = { 1: 0, 2: 0, 3: 0 };
@@ -362,23 +399,24 @@ export async function GET(
 
     console.log(`\n[scan] ════ DEBUG SUMMARY ════`);
     console.log(`  Searched username      : @${username}`);
-    console.log(`  Searched profile score : ${profileScore}`);
+    console.log(`  Searched profile score : ${profileScore}  (base=${base})`);
     console.log(`  Total following        : ${following.length}`);
     console.log(`  Total followers        : ${followers.length}`);
     console.log(`  Total non-followbacks  : ${nonFollowbacks.length}`);
     console.log(`  Total candidates scored: ${nonZeroCount}`);
     console.log(`  Eligible (base filter) : ${eligible.length}`);
-    console.log(`  Gap ranges used:`);
-    ranges.forEach((r, i) => {
-      const maxLabel = r.max === Infinity ? "∞" : String(Math.round(r.max));
-      console.log(`    R${i + 1} [${Math.round(r.min)}, ${maxLabel})  tier=${r.tier}  →  ${rangeCounts[i] ?? 0} used`);
+    console.log(`  Pass A — slot results:`);
+    SLOT_DEFS.forEach((def, i) => {
+      console.log(`    Slot ${i + 1} [base+${def.minGap}, base+${def.maxGap})  tier=${def.tier}  →  ${slotLog[i]}`);
     });
-    console.log(`  Tier 1 total: ${tierCounts[1]},  Tier 2 total: ${tierCounts[2]},  Tier 3 total: ${tierCounts[3]}`);
+    console.log(`  Pass B — filled ${finalPool.length - passACount} extra slot(s) from leftover pool`);
+    console.log(`  Tier 1: ${tierCounts[1]}  Tier 2: ${tierCounts[2]}  Tier 3: ${tierCounts[3]}`);
     console.log(`\n[scan] FINAL RESULTS (${filtered.length}):`);
     filtered.forEach((c, i) => {
-      console.log(`  ${i + 1}. @${c.username.padEnd(24)} score=${Math.round(c.score).toString().padStart(6)}  tier=${c.tier}  followers=${c.followers}`);
+      const gap = Math.round(c.score - profileScore);
+      console.log(`  ${i + 1}. @${c.username.padEnd(24)} score=${Math.round(c.score).toString().padStart(6)}  gap=+${gap}  tier=${c.tier}`);
     });
-    console.log(`  Returned usernames: ${filtered.map((c) => `@${c.username}`).join(", ")}`);
+    console.log(`  Returned: ${filtered.map((c) => `@${c.username}`).join(", ")}`);
     console.log(`${"═".repeat(60)}\n`);
 
     // ── 10. Empty state ───────────────────────────────────────────────────────
