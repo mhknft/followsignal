@@ -11,7 +11,7 @@ const HARD_BLACKLIST = new Set([
   "discord", "linkedin", "microsoft", "apple", "samsung", "github",
   "notionhq", "canva", "anthropicai", "moltbook", "openclaw",
   "balajis", "saylor", "jack", "claudeai", "skyecosystem",
-  "aave", "wublockchain", "aztecnetwork",
+  "aave", "wublockchain", "aztecnetwork", "sushiswap",
 ]);
 
 /** Normalise a username: lowercase, strip leading @, trim whitespace. */
