@@ -299,13 +299,9 @@ export async function GET(
     const SCORE_BATCH = 50;
     let scoredCount = withListScore.length;
 
-    if (validCandidates.length < 5 && withoutListScore.length > 0) {
+    if (withoutListScore.length > 0) {
       console.log(`[scan] Pass B: fetching scores for ${withoutListScore.length} zero-score accounts…`);
       for (let i = 0; i < withoutListScore.length; i += SCORE_BATCH) {
-        if (validCandidates.length >= 5) {
-          console.log(`  ✓ 5 valid found — stopping Pass B early`);
-          break;
-        }
         const batch  = withoutListScore.slice(i, i + SCORE_BATCH);
         const scores = await Promise.all(batch.map((acc) => fetchScore(acc.username)));
 
