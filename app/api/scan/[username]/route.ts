@@ -11,6 +11,7 @@ type NormalisedAccount = {
   followers: number;
   score: number;
   avatar: string;
+  userFollows: boolean; // true = searched user follows them but they don't follow back yet
 };
 
 // ─── Defensive field extraction ───────────────────────────────────────────────
@@ -55,6 +56,7 @@ function normaliseAccount(raw: Record<string, any>): NormalisedAccount {
     followers: isNaN(followers) ? 0 : followers,
     score:     isNaN(score)     ? 0 : score,
     avatar,
+    userFollows: false, // default; overridden after extraction when needed
   };
 }
 
@@ -341,7 +343,8 @@ const WIDEN_HIGH: Array<{ lo: number; hi: number }> = [
 
 /**
  * Find the single best candidate for one slot.
- * "Best" = lowest score in window (smallest gap → most natural progression).
+ * "Best" = lowest effective score in window (smallest gap → most natural progression).
+ * scoreOf() returns the effective score (real + any boost) used for window matching.
  * Returns null if every widening pass also comes up empty.
  */
 function findForSlot(
@@ -350,14 +353,15 @@ function findForSlot(
   base:     number,
   def:      SlotDef,
   widen:    Array<{ lo: number; hi: number }>,
+  scoreOf:  (c: NormalisedAccount) => number = (c) => c.score,
 ): NormalisedAccount | null {
   for (const { lo, hi } of widen) {
     const minScore = base + def.minGap * lo;
     const maxScore = base + def.maxGap * hi;
 
     const hit = eligible
-      .filter((c) => !used.has(c.username) && c.score >= minScore && c.score < maxScore)
-      .sort((a, b) => a.score - b.score)[0]; // ascending → pick smallest gap
+      .filter((c) => !used.has(c.username) && scoreOf(c) >= minScore && scoreOf(c) < maxScore)
+      .sort((a, b) => scoreOf(a) - scoreOf(b))[0]; // ascending → pick smallest effective gap
 
     if (hit) return hit;
   }
@@ -390,9 +394,17 @@ function fillSlots(
   const slotDefs = isHigh ? SLOT_DEFS_HIGH  : SLOT_DEFS_STANDARD;
   const widen    = isHigh ? WIDEN_HIGH       : WIDEN_STANDARD;
 
-  // Primary eligibility: score must be strictly above profileScore in all cases.
-  // The final validation gate enforces score > profileScore anyway, but we apply
-  // it here too so we don't waste slot capacity on ineligible candidates.
+  // Already-followed accounts get a virtual score boost for slot selection.
+  // This makes them rank higher among eligible candidates since the user
+  // following them is a strong signal they are plausible follow-back targets.
+  // The boost only affects slot matching/ordering — real Sorsa score is used for display
+  // and the final validation gate still enforces score > profileScore (real score).
+  const FOLLOW_BOOST = 200;
+  const effectiveScore = (c: NormalisedAccount) => c.score + (c.userFollows ? FOLLOW_BOOST : 0);
+
+  // Primary eligibility: real score must be strictly above profileScore.
+  // The final validation gate enforces this anyway, so we pre-filter here
+  // to avoid wasting slot capacity on candidates that will be rejected later.
   const minEligible = profileScore + 1;
 
   const dedupSeen = new Set<string>();
@@ -407,26 +419,28 @@ function fillSlots(
     .filter(isValid)
     .filter((c) => c.score > 0)
     .filter((c) => c.score >= 800)
-    .filter((c) => c.score >= minEligible)
+    .filter((c) => c.score >= minEligible) // real score floor — final gate will re-check
     .filter(dedup);
 
   const used = new Set<string>();
   const pool: ScoredAccount[] = [];
 
-  // ── Pass A: one candidate per slot with progressive widening ─────────────
+  // ── Pass A: one candidate per slot — uses effectiveScore for window matching ─
+  // Already-followed accounts appear in lower slots (higher priority) because
+  // their effective score is boosted, so they get picked before 2nd-hop accounts.
   for (const def of slotDefs) {
-    const found = findForSlot(eligible, used, base, def, widen);
+    const found = findForSlot(eligible, used, base, def, widen, effectiveScore);
     if (found) {
       used.add(found.username);
       pool.push({ ...found, tier: def.tier });
     }
   }
 
-  // ── Pass B: greedy fill from leftover eligible (ascending score) ──────────
+  // ── Pass B: greedy fill from leftover eligible (ascending effectiveScore) ────
   if (pool.length < 5) {
     const remaining = eligible
       .filter((c) => !used.has(c.username))
-      .sort((a, b) => a.score - b.score);
+      .sort((a, b) => effectiveScore(a) - effectiveScore(b));
     for (const c of remaining) {
       if (pool.length >= 5) break;
       used.add(c.username);
@@ -436,21 +450,22 @@ function fillSlots(
 
   // ── Pass C: last resort — any valid scored account above profileScore ────────
   // Only reaches here when passes A+B can't fill 5 slots from the ideal windows.
-  // Still enforces: score must be > profileScore (never lower/equal).
+  // Still enforces: real score must be > profileScore (never lower/equal).
+  // Prioritises already-followed accounts (effectiveScore desc) for natural ordering.
   if (pool.length < 5) {
     const seenC = new Set<string>();
     const lastResort = allScored
       .filter(isValid)
       .filter((c) => c.score > 0)
       .filter((c) => c.score >= 800)
-      .filter((c) => c.score > profileScore)  // strict: must beat searched profile
+      .filter((c) => c.score > profileScore)  // strict: must beat searched profile (real score)
       .filter((c) => {
         const k = c.username.toLowerCase();
         if (used.has(k) || seenC.has(k)) return false;
         seenC.add(k);
         return true;
       })
-      .sort((a, b) => b.score - a.score);
+      .sort((a, b) => effectiveScore(b) - effectiveScore(a)); // already-followed accounts first
     for (const c of lastResort) {
       if (pool.length >= 5) break;
       used.add(c.username);
@@ -458,7 +473,7 @@ function fillSlots(
     }
   }
 
-  return pool.sort((a, b) => b.score - a.score).slice(0, 5);
+  return pool.sort((a, b) => effectiveScore(b) - effectiveScore(a)).slice(0, 5);
 }
 
 // ─── Category label (tier + follower count) ──────────────────────────────────
@@ -486,16 +501,28 @@ function formatFollowers(value: unknown): string {
   return n.toString();
 }
 
-function buildReason(score: number, followers: number, name: string, tier: 1 | 2 | 3): string {
+function buildReason(score: number, followers: number, name: string, tier: 1 | 2 | 3, userFollows = false): string {
   const s = formatScore(score);
   const f = formatFollowers(followers);
 
+  if (userFollows) {
+    // Accounts the user already follows but who haven't followed back yet.
+    // These are the strongest predictions: direct orbit, no reciprocation.
+    const lines = [
+      `You follow ${name} — they haven't followed back yet. Score ${s} · ${f} followers.`,
+      `${f} followers · score ${s}. You're already in their orbit. No follow-back detected.`,
+      `High-priority candidate. You follow them, score ${s} confirms influence — awaiting reciprocation.`,
+      `Score ${s} · ${f} followers. Direct orbit match: you follow, they don't yet.`,
+    ];
+    return lines[Math.abs(Math.round(score)) % lines.length];
+  }
+
   if (tier === 1) {
     const lines = [
-      `Sorsa score ${s}. ${f} followers. You follow them — they haven't followed back yet.`,
-      `Score ${s} · ${f} followers. High-value account in your follow graph with no reciprocation.`,
-      `${f} followers · score ${s}. You're in their extended orbit — follow-back signal detected.`,
-      `High network affinity. Score ${s} places ${name} in the top tier of your non-followback list.`,
+      `Score ${s} · ${f} followers. High-value account in your extended orbit.`,
+      `${f} followers · score ${s}. Strong niche alignment — follow-back signal detected.`,
+      `${f} followers · score ${s}. You're in their cluster — follow-back probability is high.`,
+      `High network affinity. Score ${s} places ${name} at the top of nearby non-followbacks.`,
     ];
     return lines[Math.abs(Math.round(score)) % lines.length];
   }
@@ -503,8 +530,8 @@ function buildReason(score: number, followers: number, name: string, tier: 1 | 2
   if (tier === 2) {
     const lines = [
       `Score ${s} · ${f} followers. Solid candidate within your extended orbit.`,
-      `${f} followers · score ${s}. Near-orbit account with strong follow-back potential.`,
-      `Score ${s}. ${name} is in reach — follow-back probability is elevated.`,
+      `${f} followers · score ${s}. Near-orbit account with elevated follow-back potential.`,
+      `Score ${s}. ${name} is in reach — same niche, no follow-back yet.`,
     ];
     return lines[Math.abs(Math.round(score)) % lines.length];
   }
@@ -583,26 +610,66 @@ export async function GET(
     // ── 3. Build follower-back exclusion set (lowercase, no @) ────────────────
     const followsBackSet = new Set(followers.map((u) => u.username.toLowerCase().replace(/^@/, "")));
 
-    // ── 4. Find non-followbacks ───────────────────────────────────────────────
-    const nonFollowbacks = following
+    // ── 4. Find non-followbacks (accounts user follows but who haven't followed back) ──
+    // These are the primary candidate pool: the user already orbits these accounts,
+    // making them the most plausible follow-back predictions.
+    const nonFollowbacks: NormalisedAccount[] = following
       .filter((acc) => acc.username.length > 0)
-      .filter((acc) => !followsBackSet.has(acc.username.toLowerCase().replace(/^@/, "")));
+      .filter((acc) => !followsBackSet.has(acc.username.toLowerCase().replace(/^@/, "")))
+      .map((acc) => ({ ...acc, userFollows: true })); // mark: user already follows them
 
     console.log(`  Total non-followbacks  : ${nonFollowbacks.length}`);
     console.log(`  (following ${following.length} - ${following.length - nonFollowbacks.length} mutual = ${nonFollowbacks.length} candidates)`);
 
+    // ── 4b. 2nd-hop expansion: fetch follows of the top non-followback accounts ──
+    // Expands the candidate pool to include accounts that are connected to
+    // accounts the user follows but whom the user doesn't follow directly yet.
+    // These are in the same niche cluster and often have high Sorsa scores.
+    const TOP_N_2ND_HOP = 12;
+    const searchedUserLow = username.toLowerCase().replace(/^@/, "");
+    const followingUsernameSet = new Set(following.map((u) => u.username.toLowerCase().replace(/^@/, "")));
+    const topForSecondHop = [...nonFollowbacks]
+      .sort((a, b) => b.followers - a.followers)
+      .slice(0, TOP_N_2ND_HOP);
+
+    console.log(`\n[scan] ── 2nd-hop expansion: fetching follows of top ${topForSecondHop.length} non-followbacks…`);
+
+    const secondHopResults = await Promise.allSettled(
+      topForSecondHop.map((acc) => sorsaFetch(`/follows?username=${encodeURIComponent(acc.username)}`))
+    );
+
+    const secondHopSeen  = new Set<string>();
+    const secondHopAccounts: NormalisedAccount[] = [];
+
+    for (const result of secondHopResults) {
+      if (result.status !== "fulfilled") continue;
+      const accounts = extractList(result.value);
+      for (const acc of accounts) {
+        const uLow = acc.username.toLowerCase().replace(/^@/, "");
+        if (!uLow || uLow === searchedUserLow) continue;       // skip self
+        if (followsBackSet.has(uLow))         continue;       // already follows back → exclude
+        if (followingUsernameSet.has(uLow))   continue;       // already in primary pool → skip
+        if (secondHopSeen.has(uLow))          continue;       // de-duplicate
+        secondHopSeen.add(uLow);
+        secondHopAccounts.push({ ...acc, userFollows: false }); // 2nd-hop: user doesn't follow yet
+      }
+    }
+
+    console.log(`  2nd-hop new candidates : ${secondHopAccounts.length}`);
+
     // ── 5. Pre-filter candidates (5-tier relevance filter) then sort ──────────
-    // Runs once before any scoring so we never burn API quota on brand/org/bot
-    // accounts.  Sort by followers desc so we score the most prominent accounts
-    // first — they are most likely to have a Sorsa score available.
+    // Combine primary (already-followed) and 2nd-hop candidates.
+    // Sort by followers desc so we score the most prominent accounts first —
+    // they are most likely to have a Sorsa score and to beat profileScore.
     const base = Math.max(profileScore, 800);
-    const candidateList = [...nonFollowbacks]
+    const combinedPool = [...nonFollowbacks, ...secondHopAccounts];
+    const candidateList = combinedPool
       .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
       .sort((a, b) => b.followers - a.followers);
 
-    const excludedCount = nonFollowbacks.length - candidateList.length;
+    const excludedCount = combinedPool.length - candidateList.length;
     console.log(`  Excluded by relevance filter   : ${excludedCount}`);
-    console.log(`  Human candidates remaining     : ${candidateList.length}`);
+    console.log(`  Human candidates remaining     : ${candidateList.length} (${nonFollowbacks.length} primary + ${secondHopAccounts.length} 2nd-hop, minus ${excludedCount} filtered)`);
 
     // ── 6. Multi-round scoring: keep expanding until 5 results are found ──────
     //
@@ -745,7 +812,8 @@ export async function GET(
     console.log(`  Searched profile score         : ${profileScore}  (base=${base})`);
     console.log(`  Total following                : ${following.length}`);
     console.log(`  Total followers                : ${followers.length}`);
-    console.log(`  Total non-followbacks          : ${nonFollowbacks.length}`);
+    console.log(`  Total non-followbacks (primary): ${nonFollowbacks.length}`);
+    console.log(`  2nd-hop expansion accounts     : ${secondHopAccounts.length}`);
     console.log(`  Excluded by relevance filter   : ${excludedCount}`);
     console.log(`  Human candidates remaining     : ${candidateList.length}`);
     console.log(`  Total candidates scored        : ${allScored.length} (${totalNonZero} non-zero)`);
@@ -756,8 +824,9 @@ export async function GET(
     console.log(`  Tier 1: ${tierCounts[1]}  Tier 2: ${tierCounts[2]}  Tier 3: ${tierCounts[3]}`);
     console.log(`\n[scan] FINAL RESULTS (${filtered.length}):`);
     filtered.forEach((c, i) => {
-      const gap = Math.round(c.score - profileScore);
-      console.log(`  ${i + 1}. @${c.username.padEnd(24)} score=${Math.round(c.score).toString().padStart(6)}  gap=+${gap}  tier=${c.tier}`);
+      const gap    = Math.round(c.score - profileScore);
+      const origin = c.userFollows ? "primary(follows)" : "2nd-hop";
+      console.log(`  ${i + 1}. @${c.username.padEnd(24)} score=${Math.round(c.score).toString().padStart(6)}  gap=+${gap}  tier=${c.tier}  [${origin}]`);
     });
     console.log(`  Returned: ${filtered.map((c) => `@${c.username}`).join(", ")}`);
     console.log(`${"═".repeat(60)}\n`);
@@ -844,7 +913,7 @@ export async function GET(
         category: categoryFromTier(entry.tier, entry.followers, isFallback),
         score: entry.score,
         matchPercent: Math.round((entry.score / maxScore) * 100),
-        reason: buildReason(entry.score, entry.followers, entry.name, entry.tier),
+        reason: buildReason(entry.score, entry.followers, entry.name, entry.tier, entry.userFollows),
         isWildcard: isWild,
         position: isWild ? "bottom-center" : (POSITIONS[i] ?? "bottom-center"),
       };
