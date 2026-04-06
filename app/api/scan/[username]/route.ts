@@ -11,7 +11,8 @@ type NormalisedAccount = {
   followers: number;
   score: number;
   avatar: string;
-  userFollows: boolean; // true = searched user follows them but they don't follow back yet
+  userFollows: boolean;      // true = searched user follows them but they don't follow back yet
+  scoreEstimated?: boolean;  // true = no real Sorsa score; estimate derived from follower count
 };
 
 // ─── Defensive field extraction ───────────────────────────────────────────────
@@ -210,21 +211,17 @@ const ORG_USERNAME_RE = [
 ];
 
 // ── Tier 6: generic brand / platform heuristic ───────────────────────────────
-// Catches product accounts that didn't match any explicit list.
-// Two signals, either of which is sufficient to exclude:
-//   A. Display name is exactly two words and the first word is "X"
-//      (e.g. "X Premium", "X Corp", "X Safety" — Twitter/X product accounts).
-//   B. Display name is a single word AND the account has ≥ 500 K followers.
-//      Real CT personalities at that scale almost always have multi-word names;
-//      single-word 500K+ accounts are virtually always platforms or features.
-function looksLikeGenericBrand(name: string, followers: number): boolean {
+// Only Signal A is kept: display name is exactly two words and the first word
+// is "X" (e.g. "X Premium", "X Corp" — Twitter/X product accounts).
+//
+// Signal B (single-word name ≥ 500K) was removed because it incorrectly
+// excludes real CT personalities like @Zeneca whose display name is one word.
+// The first five tiers already handle genuine brand/org accounts.
+function looksLikeGenericBrand(name: string, _followers: number): boolean {
   const words = name.trim().split(/\s+/).filter((w) => w.length > 0);
 
   // Signal A — "X <Anything>" two-word product names
   if (words.length === 2 && words[0] === "X") return true;
-
-  // Signal B — single-word name with massive following
-  if (words.length === 1 && followers >= 500_000) return true;
 
   return false;
 }
@@ -418,8 +415,10 @@ function fillSlots(
   const eligible = allScored
     .filter(isValid)
     .filter((c) => c.score > 0)
-    .filter((c) => c.score >= 800)
-    .filter((c) => c.score >= minEligible) // real score floor — final gate will re-check
+    // Score floor: already-followed accounts are accepted from 600 (they may have only
+    // a follower-based estimate); 2nd-hop accounts still require 800.
+    .filter((c) => c.score >= (c.userFollows ? 600 : 800))
+    .filter((c) => c.score >= minEligible) // must beat profileScore — final gate re-checks
     .filter(dedup);
 
   const used = new Set<string>();
@@ -457,8 +456,8 @@ function fillSlots(
     const lastResort = allScored
       .filter(isValid)
       .filter((c) => c.score > 0)
-      .filter((c) => c.score >= 800)
-      .filter((c) => c.score > profileScore)  // strict: must beat searched profile (real score)
+      .filter((c) => c.score >= (c.userFollows ? 600 : 800))
+      .filter((c) => c.score > profileScore)  // strict: must beat searched profile
       .filter((c) => {
         const k = c.username.toLowerCase();
         if (used.has(k) || seenC.has(k)) return false;
@@ -553,6 +552,25 @@ async function sorsaFetch(path: string): Promise<unknown> {
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
+}
+
+/**
+ * Rough follower-count → Sorsa-score estimate used when the Sorsa API returns
+ * 0 (account not yet indexed).  The values are intentionally conservative so
+ * estimated accounts never crowd out accounts with real scores.
+ * Used ONLY as a fallback when score === 0.
+ */
+function estimateScoreFromFollowers(followers: number): number {
+  if (followers >= 1_000_000) return 2800;
+  if (followers >= 500_000)   return 2300;
+  if (followers >= 200_000)   return 1900;
+  if (followers >= 100_000)   return 1600;
+  if (followers >=  50_000)   return 1400;
+  if (followers >=  20_000)   return 1200;
+  if (followers >=  10_000)   return 1000;
+  if (followers >=   5_000)   return  850;
+  if (followers >=   1_000)   return  650;
+  return 400;
 }
 
 /** Fetch individual score for a single username. Returns 0 on any failure. */
@@ -684,10 +702,11 @@ export async function GET(
     const ROUND_SIZE = 1500;
     const MAX_ROUNDS = 3;
 
-    let allScored:   NormalisedAccount[] = [];
-    let filtered:    ScoredAccount[]     = [];
-    let totalNonZero = 0;
-    let exhausted    = false;
+    let allScored:    NormalisedAccount[] = [];
+    let filtered:     ScoredAccount[]     = [];
+    let totalNonZero  = 0;
+    let totalEstimated = 0;
+    let exhausted     = false;
 
     for (let round = 0; round < MAX_ROUNDS; round++) {
       const batch = candidateList.slice(round * ROUND_SIZE, (round + 1) * ROUND_SIZE);
@@ -696,12 +715,31 @@ export async function GET(
       console.log(`\n[scan] Round ${round + 1}: scoring ${batch.length} candidates (offset ${round * ROUND_SIZE})…`);
 
       const batchScores = await Promise.all(batch.map((acc) => fetchScore(acc.username)));
-      const batchScored  = batch.map((acc, i) => ({ ...acc, score: batchScores[i] }));
-      allScored    = [...allScored, ...batchScored];
-      totalNonZero = allScored.filter((c) => c.score > 0).length;
+
+      // For accounts with score=0 (not in Sorsa DB), use a follower-based estimate
+      // so they aren't silently dropped by the score>0 gate.  Estimated scores are
+      // intentionally conservative and flagged with scoreEstimated=true.
+      const batchScored = batch.map((acc, i) => {
+        const realScore = batchScores[i];
+        if (realScore > 0) return { ...acc, score: realScore };
+        const est = estimateScoreFromFollowers(acc.followers);
+        return { ...acc, score: est, scoreEstimated: true };
+      });
+
+      allScored     = [...allScored, ...batchScored];
+      totalNonZero  = allScored.filter((c) => c.score > 0 && !c.scoreEstimated).length;
+      totalEstimated = allScored.filter((c) => c.scoreEstimated).length;
+
+      // ── Per-stage debug counts ────────────────────────────────────────────────
+      const afterScoreGate = allScored.filter((c) => c.score > profileScore);
+      console.log(`  After round ${round + 1}:`);
+      console.log(`    Real scores (non-zero) : ${totalNonZero}`);
+      console.log(`    Estimated scores       : ${totalEstimated}`);
+      console.log(`    Passing score gate     : ${afterScoreGate.length}  (score > ${profileScore})`);
+      console.log(`    Already-followed in pool: ${afterScoreGate.filter((c) => c.userFollows).length}`);
 
       filtered = fillSlots(allScored, base, profileScore);
-      console.log(`  After round ${round + 1}: ${filtered.length} result(s) / ${totalNonZero} non-zero scores`);
+      console.log(`    fillSlots result       : ${filtered.length} candidate(s)`);
 
       if (filtered.length >= 5) break;
       if (round < MAX_ROUNDS - 1) {
@@ -873,11 +911,33 @@ export async function GET(
       }
 
       finalSeen.add(key);
-      console.log(`  PASS   @${key}: score=${c.score}`);
+      console.log(`  PASS   @${key}: score=${c.score}${c.scoreEstimated ? " (estimated)" : ""} userFollows=${c.userFollows}`);
       return true;
     });
 
     console.log(`  Gate result: ${validated.length} / ${filtered.length} passed`);
+
+    // ── Build debug info (returned in every response for diagnostics) ─────────
+    const afterScoreFilter = allScored.filter((c) => c.score > profileScore);
+    const debugInfo = {
+      profileScore,
+      followedByUserCount:     nonFollowbacks.length,
+      secondHopCount:          secondHopAccounts.length,
+      totalCandidatePool:      candidateList.length,
+      afterScoreFilter:        afterScoreFilter.length,
+      afterScoreFilterFollows: afterScoreFilter.filter((c) => c.userFollows).length,
+      realScores:              allScored.filter((c) => c.score > 0 && !c.scoreEstimated).length,
+      estimatedScores:         allScored.filter((c) => c.scoreEstimated).length,
+      filteredByTier6Brand:    combinedPool.filter((acc) => isFiltered(acc.name, acc.username, acc.followers)).length,
+      finalCandidateUsernames: validated.map((c) => `@${c.username}`),
+      top20BeforeSlice:        afterScoreFilter
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 20)
+        .map((c) => ({ u: c.username, score: Math.round(c.score), estimated: !!c.scoreEstimated, follows: c.userFollows })),
+    };
+
+    console.log(`\n[scan] DEBUG INFO:`);
+    console.log(JSON.stringify(debugInfo, null, 2));
 
     // ── 10. Empty state ───────────────────────────────────────────────────────
     if (validated.length === 0) {
@@ -885,6 +945,7 @@ export async function GET(
         predictions: [],
         exhausted: true,
         message: "No stronger non-followback matches found",
+        debug: debugInfo,
       });
     }
 
@@ -898,7 +959,7 @@ export async function GET(
 
     console.log(`\n[scan] RETURNING ${finalFiltered.length} accounts:`);
     finalFiltered.forEach((c, i) => {
-      console.log(`  ${i + 1}. @${c.username}  score=${Math.round(c.score)}`);
+      console.log(`  ${i + 1}. @${c.username}  score=${Math.round(c.score)}${c.scoreEstimated ? " (est)" : ""}  follows=${c.userFollows}`);
     });
 
     const predictions: PredictedAccount[] = ordered.map((entry, i) => {
@@ -919,7 +980,7 @@ export async function GET(
       };
     });
 
-    return NextResponse.json({ predictions, exhausted });
+    return NextResponse.json({ predictions, exhausted, debug: debugInfo });
   } catch (err) {
     console.error("[/api/scan] fatal error:", err);
     return NextResponse.json(
