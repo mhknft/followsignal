@@ -437,9 +437,13 @@ function fillSlots(
   }
 
   // ── Passes C–F: progressive relaxation — triggered only when < 5 found ───────
-  // Each pass lowers the effective-score floor by 20 % of profileScore so we
-  // always surface the best nearby candidates rather than returning blank cards.
+  // Each pass lowers the effective-score floor so we always surface the best
+  // nearby candidates rather than returning blank cards.
   // Already-followed accounts dominate each pass because of FOLLOW_BOOST.
+  // Tier assignment is score-relative so labels stay meaningful:
+  //   tier 1 → score > profileScore (strong match)
+  //   tier 2 → score > 75 % of profileScore (near orbit)
+  //   tier 3 → everything else (possible next / watchlist)
   if (pool.length < 5) {
     const floors = [
       profileScore * 0.80,   // Pass C — within 20 % below
@@ -454,7 +458,10 @@ function fillSlots(
       for (const c of relaxed) {
         if (pool.length >= 5) break;
         used.add(usedKey(c));
-        pool.push({ ...c, tier: 3 });
+        const tier: Tier = c.score > profileScore      ? 1
+                         : c.score > profileScore * 0.75 ? 2
+                         : 3;
+        pool.push({ ...c, tier });
       }
     }
   }
@@ -462,13 +469,35 @@ function fillSlots(
   return pool.sort((a, b) => effectiveScore(b) - effectiveScore(a)).slice(0, 5);
 }
 
-// ─── Category label (tier + follower count) ──────────────────────────────────
+// ─── Category label ──────────────────────────────────────────────────────────
+//
+// Labels are derived from the candidate's actual score relative to the searched
+// profile's score, NOT from the slot tier (which only reflects selection order).
+// This ensures the UI label honestly reflects how strong each candidate is:
+//
+//   score > profileScore               → Strong Match / Rare Pick
+//   score > 0.75 × profileScore        → Near Orbit / High Potential
+//   score > 0.50 × profileScore        → Possible Next
+//   score ≤ 0.50 × profileScore        → Watchlist
 
-function categoryFromTier(tier: Tier, followers: number, isFallback = false): string {
-  if (isFallback) return followers >= 10_000 ? "Possible Next" : "Weak Signal";
-  if (tier === 1) return followers >= 500_000 ? "Rare Pick"      : "Strong Match";
-  if (tier === 2) return followers >= 100_000 ? "Near Orbit"     : "High Potential";
-  return                 followers >= 50_000  ? "Watchlist"      : "Possible Next";
+function categoryForCandidate(
+  score:        number,
+  profileScore: number,
+  followers:    number,
+  userFollows:  boolean,
+): string {
+  if (score > profileScore) {
+    // Genuinely above the searched profile — highest-confidence prediction.
+    return followers >= 200_000 ? "Rare Pick" : "Strong Match";
+  }
+  if (score > profileScore * 0.75 || userFollows) {
+    // Close to profile score, or the user already follows them (strong orbit signal).
+    return followers >= 50_000 ? "Near Orbit" : "High Potential";
+  }
+  if (score > profileScore * 0.50) {
+    return "Possible Next";
+  }
+  return followers >= 10_000 ? "Watchlist" : "Possible Next";
 }
 
 // ─── Display helpers ──────────────────────────────────────────────────────────
@@ -487,45 +516,61 @@ function formatFollowers(value: unknown): string {
   return n.toString();
 }
 
-function buildReason(score: number, followers: number, name: string, tier: 1 | 2 | 3, userFollows = false): string {
+function buildReason(
+  score:        number,
+  profileScore: number,
+  followers:    number,
+  name:         string,
+  userFollows:  boolean,
+): string {
   const s = formatScore(score);
   const f = formatFollowers(followers);
 
-  if (userFollows) {
-    // Accounts the user already follows but who haven't followed back yet.
-    // These are the strongest predictions: direct orbit, no reciprocation.
+  if (userFollows && score > profileScore) {
+    // Best case: user follows them AND their score is higher.
     const lines = [
       `You follow ${name} — they haven't followed back yet. Score ${s} · ${f} followers.`,
-      `${f} followers · score ${s}. You're already in their orbit. No follow-back detected.`,
-      `High-priority candidate. You follow them, score ${s} confirms influence — awaiting reciprocation.`,
+      `${f} followers · score ${s}. You're already in their orbit — no reciprocation yet.`,
       `Score ${s} · ${f} followers. Direct orbit match: you follow, they don't yet.`,
+      `High-priority. You follow them — score ${s} places them above your current network.`,
     ];
     return lines[Math.abs(Math.round(score)) % lines.length];
   }
 
-  if (tier === 1) {
+  if (userFollows) {
+    // User follows them but their score is below profileScore (still a strong signal).
+    const lines = [
+      `You follow ${name} — they haven't followed back yet. ${f} followers · score ${s}.`,
+      `${f} followers · score ${s}. You're already in their orbit — awaiting reciprocation.`,
+      `Score ${s} · ${f} followers. Nearby orbit match — you follow, they don't yet.`,
+    ];
+    return lines[Math.abs(Math.round(score)) % lines.length];
+  }
+
+  if (score > profileScore) {
+    // 2nd-hop / extended network, above profile.
     const lines = [
       `Score ${s} · ${f} followers. High-value account in your extended orbit.`,
       `${f} followers · score ${s}. Strong niche alignment — follow-back signal detected.`,
-      `${f} followers · score ${s}. You're in their cluster — follow-back probability is high.`,
-      `High network affinity. Score ${s} places ${name} at the top of nearby non-followbacks.`,
+      `${f} followers · score ${s}. In your cluster — follow-back probability is elevated.`,
     ];
     return lines[Math.abs(Math.round(score)) % lines.length];
   }
 
-  if (tier === 2) {
+  if (score > profileScore * 0.75) {
+    // Near-orbit: slightly below but in the same range.
     const lines = [
-      `Score ${s} · ${f} followers. Solid candidate within your extended orbit.`,
-      `${f} followers · score ${s}. Near-orbit account with elevated follow-back potential.`,
-      `Score ${s}. ${name} is in reach — same niche, no follow-back yet.`,
+      `Score ${s} · ${f} followers. Near your orbit — close match in network proximity.`,
+      `${f} followers · score ${s}. Adjacent niche — elevated mutual follow probability.`,
+      `Score ${s}. ${name} is in reach — same niche cluster, no follow-back yet.`,
     ];
     return lines[Math.abs(Math.round(score)) % lines.length];
   }
 
-  // Tier 3
+  // Fallback: below 75 % of profileScore — honest watchlist tone.
   const lines = [
-    `Score ${s} · ${f} followers. Potential follow-back in your network graph.`,
-    `${f} followers · score ${s}. Watchlist candidate — mutual follow signal present.`,
+    `Score ${s} · ${f} followers. Best available nearby match in your follow graph.`,
+    `${f} followers · score ${s}. Watchlist candidate — active in your niche.`,
   ];
   return lines[Math.abs(Math.round(score)) % lines.length];
 }
@@ -734,12 +779,12 @@ export async function GET(
       }
     }
 
-    // ── 6b. Fallback Pass D: use reverse-follow candidates when still < 5 ──────
-    // Triggered when the scanned user's follow graph is too sparse to fill 5
-    // slots (e.g. accounts that follow very few people).  We look at *followers*
-    // (accounts that follow the scanned user but aren't followed back) and score
-    // up to 500 of them.  Score floor is lowered to 400 so we still surface
-    // meaningful accounts even in thin networks.
+    // ── 6b. Pass D: reverse-follow fallback ───────────────────────────────────
+    // Triggered when the primary follow-graph pool yielded < 5 results.
+    // Looks at accounts that FOLLOW the searched user but haven't been followed
+    // back yet — "influential fans."  Uses the same progressive-relaxation
+    // approach as fillSlots (no hard score > profileScore gate) so sparse
+    // networks (like @zaimiri) still surface meaningful candidates.
     let fallbackUsed  = false;
     let emergencyUsed = false;
 
@@ -749,67 +794,98 @@ export async function GET(
 
       const alreadyUsed  = new Set(filtered.map((c) => c.username.toLowerCase()));
       const followingSet = new Set(following.map((u) => u.username.toLowerCase().replace(/^@/, "")));
+      const FOLLOW_BOOST_D = 200;
 
-      // Only score followers who the user doesn't follow back (true one-way fans)
+      // Followers the user hasn't followed back — sorted by followers desc
+      // so we score the most prominent fans first (better Sorsa coverage).
       const reverseCandidates = followers
         .filter((acc) => acc.username.length > 0)
         .filter((acc) => !followingSet.has(acc.username.toLowerCase().replace(/^@/, "")))
         .filter((acc) => !alreadyUsed.has(acc.username.toLowerCase()))
         .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
         .sort((a, b) => b.followers - a.followers)
-        .slice(0, 500);
+        .slice(0, 300);
 
       console.log(`  Reverse candidates (followers not followed back): ${reverseCandidates.length}`);
 
       if (reverseCandidates.length > 0) {
-        const reverseScores = await Promise.all(reverseCandidates.map((acc) => fetchScore(acc.username)));
-        const reverseScored = reverseCandidates.map((acc, i) => ({ ...acc, score: reverseScores[i] }));
+        const reverseRaw    = await Promise.all(reverseCandidates.map((acc) => fetchScore(acc.username)));
+        // Apply follower-based estimate when Sorsa returns 0
+        const reverseScored = reverseCandidates.map((acc, i) => {
+          const real = reverseRaw[i];
+          if (real > 0) return { ...acc, score: real, userFollows: false };
+          return { ...acc, score: estimateScoreFromFollowers(acc.followers), scoreEstimated: true, userFollows: false };
+        });
 
-        const needed = 5 - filtered.length;
-        const reverseValid = reverseScored
-          .filter(isValid)
-          .filter((c) => c.score > 0)
-          .filter((c) => c.score > profileScore)  // must still beat searched profile
-          .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
-          .sort((a, b) => b.score - a.score)
-          .slice(0, needed);
+        // Sort by effective score desc; no hard gate — use same progressive
+        // floors as fillSlots so we always fill slots when candidates exist.
+        const effD = (c: NormalisedAccount) => c.score + (c.userFollows ? FOLLOW_BOOST_D : 0);
+        const floors = [profileScore, profileScore * 0.80, profileScore * 0.60, profileScore * 0.40, 0];
+        for (const floor of floors) {
+          if (filtered.length >= 5) break;
+          const needed = 5 - filtered.length;
+          const valid = reverseScored
+            .filter(isValid)
+            .filter((c) => c.score > 0)
+            .filter((c) => effD(c) > floor)
+            .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
+            .sort((a, b) => effD(b) - effD(a))
+            .slice(0, needed);
 
-        console.log(`  Pass D qualified: ${reverseValid.length}`);
-
-        for (const c of reverseValid) {
-          filtered.push({ ...c, tier: 3 as Tier });
-          alreadyUsed.add(c.username.toLowerCase());
+          for (const c of valid) {
+            const tier: Tier = c.score > profileScore ? 1 : (c.score > profileScore * 0.75 ? 2 : 3);
+            filtered.push({ ...c, tier });
+            alreadyUsed.add(c.username.toLowerCase());
+          }
         }
+
+        console.log(`  Pass D added: ${filtered.length - (5 - (5 - filtered.length))} new candidate(s) (total now: ${filtered.length})`);
       }
     }
 
-    // ── 6c. Emergency fallback: if still < 5, lower floor further to 0 ─────────
-    // Last possible resort — accepts any valid scored account.
+    // ── 6c. Emergency fallback ────────────────────────────────────────────────
+    // Still < 5 after all primary + reverse-follow passes.
+    // Re-scores the top 200 candidates from all available pools with the same
+    // progressive relaxation — no hard score gate.
     if (filtered.length < 5) {
       emergencyUsed = true;
-      console.log(`\n[scan] ── Emergency fallback: ${5 - filtered.length} slot(s) still empty, lowering floor to 0…`);
+      console.log(`\n[scan] ── Emergency fallback: ${5 - filtered.length} slot(s) still empty…`);
 
       const alreadyUsed = new Set(filtered.map((c) => c.username.toLowerCase()));
-      const allCandidates = [...candidateList, ...followers]
+      const emergencyPool = [...candidateList, ...followers]
+        .filter((acc) => acc.username.length > 0)
+        .filter((acc) => !followsBackSet.has(acc.username.toLowerCase().replace(/^@/, "")))
         .filter((acc) => !alreadyUsed.has(acc.username.toLowerCase().replace(/^@/, "")))
         .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
         .sort((a, b) => b.followers - a.followers)
         .slice(0, 200);
 
-      const emergencyScores = await Promise.all(allCandidates.map((acc) => fetchScore(acc.username)));
-      const emergencyScored = allCandidates
-        .map((acc, i) => ({ ...acc, score: emergencyScores[i] }))
-        .filter(isValid)
-        .filter((c) => c.score > 0)
-        .filter((c) => c.score > profileScore)  // still enforced even in emergency
-        .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
-        .sort((a, b) => b.score - a.score);
+      const emergencyRaw    = await Promise.all(emergencyPool.map((acc) => fetchScore(acc.username)));
+      const emergencyScored = emergencyPool.map((acc, i) => {
+        const real = emergencyRaw[i];
+        const score = real > 0 ? real : estimateScoreFromFollowers(acc.followers);
+        return { ...acc, score, scoreEstimated: real === 0 };
+      });
 
-      const needed = 5 - filtered.length;
-      for (const c of emergencyScored.slice(0, needed)) {
-        filtered.push({ ...c, tier: 3 as Tier });
+      const floors = [profileScore, profileScore * 0.80, profileScore * 0.60, 0];
+      for (const floor of floors) {
+        if (filtered.length >= 5) break;
+        const needed = 5 - filtered.length;
+        const valid = emergencyScored
+          .filter(isValid)
+          .filter((c) => c.score > 0)
+          .filter((c) => c.score > floor)
+          .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, needed);
+
+        for (const c of valid) {
+          const tier: Tier = c.score > profileScore ? 1 : (c.score > profileScore * 0.75 ? 2 : 3);
+          filtered.push({ ...c, tier });
+          alreadyUsed.add(c.username.toLowerCase());
+        }
       }
-      console.log(`  Emergency fallback added: ${emergencyScored.slice(0, needed).length}`);
+      console.log(`  Emergency fallback total now: ${filtered.length}`);
     }
 
     if (!exhausted && filtered.length < 5) exhausted = true;
@@ -933,6 +1009,8 @@ export async function GET(
 
     const debugInfo = {
       profileScore:            Math.round(profileScore),
+      followingApiCount:       following.length,
+      followersApiCount:       followers.length,
       followedByUserCount:     nonFollowbacks.length,
       secondHopCount:          secondHopAccounts.length,
       totalCandidatePool:      candidateList.length,
@@ -951,10 +1029,16 @@ export async function GET(
 
     // ── 10. Empty state ───────────────────────────────────────────────────────
     if (validated.length === 0) {
+      // Distinguish between "no graph data" and "graph exists but no matches"
+      const hasGraphData = following.length > 0 || followers.length > 0;
+      const emptyMessage = !hasGraphData && profileScore > 0
+        ? "Follow network not indexed yet — Sorsa has your score but no follow graph data. Try again in a few hours."
+        : "No follow-back candidates found in your current network.";
+
       return NextResponse.json({
         predictions: [],
         exhausted: true,
-        message: "No stronger non-followback matches found",
+        message: emptyMessage,
         debug: debugInfo,
       });
     }
@@ -972,19 +1056,22 @@ export async function GET(
       console.log(`  ${i + 1}. @${c.username}  score=${Math.round(c.score)}${c.scoreEstimated ? " (est)" : ""}  follows=${c.userFollows}`);
     });
 
+    // matchPercent: 100 = equal to or above profileScore; scales linearly below.
+    // Capped at 100 so accounts above profileScore all show 100 % (strong match).
+    const matchRef = Math.max(profileScore, 1);
+
     const predictions: PredictedAccount[] = ordered.map((entry, i) => {
-      const isWild     = i === ordered.length - 1;
-      const isFallback = (fallbackUsed || emergencyUsed) && entry.score < base;
+      const isWild = i === ordered.length - 1;
       return {
         id: i + 1,
         name: entry.name,
         username: `@${entry.username}`,
         avatar: entry.avatar,
         followers: entry.followers,
-        category: categoryFromTier(entry.tier, entry.followers, isFallback),
+        category: categoryForCandidate(entry.score, profileScore, entry.followers, entry.userFollows),
         score: entry.score,
-        matchPercent: Math.round((entry.score / maxScore) * 100),
-        reason: buildReason(entry.score, entry.followers, entry.name, entry.tier, entry.userFollows),
+        matchPercent: Math.min(100, Math.round((entry.score / matchRef) * 100)),
+        reason: buildReason(entry.score, profileScore, entry.followers, entry.name, entry.userFollows),
         isWildcard: isWild,
         position: isWild ? "bottom-center" : (POSITIONS[i] ?? "bottom-center"),
       };
