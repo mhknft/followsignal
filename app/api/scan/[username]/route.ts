@@ -587,10 +587,66 @@ async function sorsaFetch(path: string): Promise<unknown> {
 }
 
 /**
+ * Fetch ALL pages from a paginated Sorsa list endpoint.
+ *
+ * Sorsa caps each response at ~200 accounts.  Without pagination the
+ * followsBackSet is incomplete, allowing real follow-backs to leak through
+ * as candidates.
+ *
+ * Strategy:
+ *  - Try page=1…maxPages, appending &page=N to the path.
+ *  - Deduplicate by normalised username (lowercase, no @).
+ *  - Stop when: (a) no new accounts added (pagination exhausted or not
+ *    supported — same page returns repeatedly), (b) fewer accounts than
+ *    PAGE_SIZE (last page), or (c) maxPages reached.
+ *
+ * If Sorsa does not support pagination the parameter is silently ignored and
+ * we stop after page 2 (newCount === 0).
+ */
+const SORSA_PAGE_SIZE = 200;
+
+async function fetchAllPages(
+  basePath: string,
+  maxPages  = 10,
+): Promise<NormalisedAccount[]> {
+  const all: NormalisedAccount[] = [];
+  const seen = new Set<string>();
+
+  for (let page = 1; page <= maxPages; page++) {
+    let raw: unknown;
+    try {
+      const sep = basePath.includes("?") ? "&" : "?";
+      raw = await sorsaFetch(`${basePath}${sep}page=${page}&limit=${SORSA_PAGE_SIZE}`);
+    } catch (e) {
+      console.log(`[scan] fetchAllPages page=${page} failed — stopping`, e);
+      break;
+    }
+
+    const batch = extractList(raw);
+    let newCount = 0;
+    for (const acc of batch) {
+      const k = acc.username.toLowerCase().replace(/^@/, "").trim();
+      if (k && !seen.has(k)) {
+        seen.add(k);
+        all.push(acc);
+        newCount++;
+      }
+    }
+
+    console.log(`[scan] fetchAllPages ${basePath.split("?")[0]} page=${page}: got=${batch.length} new=${newCount} total=${all.length}`);
+
+    // Stop conditions
+    if (newCount === 0)                  break; // no new data (non-paginating API or truly exhausted)
+    if (batch.length < SORSA_PAGE_SIZE)  break; // last page (shorter than full page)
+  }
+
+  return all;
+}
+
+/**
  * Rough follower-count → Sorsa-score estimate used when the Sorsa API returns
- * 0 (account not yet indexed).  The values are intentionally conservative so
- * estimated accounts never crowd out accounts with real scores.
- * Used ONLY as a fallback when score === 0.
+ * 0 (account not yet indexed).  Conservative values ensure estimated accounts
+ * never crowd out accounts with real scores.  Used ONLY when score === 0.
  */
 function estimateScoreFromFollowers(followers: number): number {
   if (followers >= 1_000_000) return 2800;
@@ -635,27 +691,32 @@ export async function GET(
   console.log(`${"═".repeat(60)}`);
 
   try {
-    // ── 1. Parallel: following list + followers list + profile score ───────────
-    const [followsRaw, followersRaw, profileScoreRaw] = await Promise.allSettled([
-      sorsaFetch(`/follows?username=${enc}`),
-      sorsaFetch(`/followers?username=${enc}`),
-      sorsaFetch(`/score?username=${enc}`),
+    // ── 1. Fetch profile score + paginated follow graph ────────────────────────
+    //
+    // /followers is paginated: Sorsa caps each page at ~200 accounts.
+    // Without full pagination the followsBackSet is incomplete, letting real
+    // follow-backs leak into results.  fetchAllPages() deduplicates across pages
+    // and stops safely when no new accounts are added (handles non-paginating APIs).
+    //
+    // Run score + both graph fetches concurrently; follower/following lists then
+    // continue paginating independently while the other awaits.
+    console.log("\n[scan] ── Fetching profile score + paginated follow graph ──");
+
+    const [profileScoreRaw, following, followers] = await Promise.all([
+      sorsaFetch(`/score?username=${enc}`).catch((e) => {
+        console.log("[scan] ✗ /score failed:", e); return null;
+      }),
+      fetchAllPages(`/follows?username=${enc}`),
+      fetchAllPages(`/followers?username=${enc}`),
     ]);
 
-    if (followsRaw.status   === "rejected") console.log("[scan] ✗ /follows failed:", followsRaw.reason);
-    if (followersRaw.status === "rejected") console.log("[scan] ✗ /followers failed:", followersRaw.reason);
-    if (profileScoreRaw.status === "rejected") console.log("[scan] ✗ /score failed:", profileScoreRaw.reason);
-
-    console.log("\n[scan] ── Extracting lists ──");
-    const following    = followsRaw.status    === "fulfilled" ? extractList(followsRaw.value)    : [];
-    const followers    = followersRaw.status  === "fulfilled" ? extractList(followersRaw.value)  : [];
-    const profileScore = profileScoreRaw.status === "fulfilled" ? extractScore(profileScoreRaw.value) : 0;
+    const profileScore = profileScoreRaw ? extractScore(profileScoreRaw) : 0;
 
     // ── 2. Debug summary ──────────────────────────────────────────────────────
     console.log(`\n[scan] DEBUG SUMMARY:`);
     console.log(`  Searched profile score : ${profileScore}`);
-    console.log(`  Total following        : ${following.length}`);
-    console.log(`  Total followers        : ${followers.length}`);
+    console.log(`  Total following        : ${following.length}  (all pages)`);
+    console.log(`  Total followers        : ${followers.length}  (all pages)`);
 
     // ── 3. Build follower-back exclusion set (lowercase, no @) ────────────────
     const followsBackSet = new Set(followers.map((u) => u.username.toLowerCase().replace(/^@/, "")));
@@ -721,24 +782,28 @@ export async function GET(
     console.log(`  Excluded by relevance filter   : ${excludedCount}`);
     console.log(`  Human candidates remaining     : ${candidateList.length} (${nonFollowbacks.length} primary + ${secondHopAccounts.length} 2nd-hop, minus ${excludedCount} filtered)`);
 
-    // ── 6. Multi-round scoring: keep expanding until 5 results are found ──────
+    // ── 6. Deep scoring: exhaust the candidate pool before slot filling ──────────
     //
-    // Round 1 : score top 1 500 human candidates by followers count.
-    // Round 2 : score the next 1 500 if < 5 found after round 1.
-    // Round 3 : score the next 1 500 (up to 4 500 total) as a last resort.
+    // Key design change from previous approach:
+    //   OLD: score round 1 → fillSlots → stop if 5 found (even with weak candidates)
+    //   NEW: score ALL rounds → check for strong candidates → only then fillSlots
     //
-    // Each round appends to allScored and re-runs fillSlots() on the full
-    // cumulative pool (Pass A slot-fill → Pass B greedy → Pass C last-resort).
-    // The loading screen stays up naturally while rounds 2–3 execute.
+    // Early-stop rule: only stop scoring when 5+ STRONG candidates exist.
+    //   "Strong" = userFollows=true AND score > profileScore
+    //   This ensures we never fill slots with weak fallback accounts while
+    //   stronger candidates are still unscored in later rounds.
+    //
+    // Round size = 500 (smaller than before so progress logs are more granular).
+    // Up to 9 rounds = 4 500 candidates maximum.
 
-    const ROUND_SIZE = 1500;
-    const MAX_ROUNDS = 3;
+    const ROUND_SIZE  = 500;
+    const MAX_ROUNDS  = 9;
 
-    let allScored:    NormalisedAccount[] = [];
-    let filtered:     ScoredAccount[]     = [];
-    let totalNonZero  = 0;
+    let allScored:     NormalisedAccount[] = [];
+    let filtered:      ScoredAccount[]     = [];
+    let totalNonZero   = 0;
     let totalEstimated = 0;
-    let exhausted     = false;
+    let exhausted      = false;
 
     for (let round = 0; round < MAX_ROUNDS; round++) {
       const batch = candidateList.slice(round * ROUND_SIZE, (round + 1) * ROUND_SIZE);
@@ -748,36 +813,36 @@ export async function GET(
 
       const batchScores = await Promise.all(batch.map((acc) => fetchScore(acc.username)));
 
-      // For accounts with score=0 (not in Sorsa DB), use a follower-based estimate
-      // so they aren't silently dropped by the score>0 gate.  Estimated scores are
-      // intentionally conservative and flagged with scoreEstimated=true.
+      // When Sorsa returns 0 (account not indexed), substitute a follower-based
+      // estimate so the account isn't silently dropped by the score > 0 gate.
       const batchScored = batch.map((acc, i) => {
         const realScore = batchScores[i];
         if (realScore > 0) return { ...acc, score: realScore };
-        const est = estimateScoreFromFollowers(acc.followers);
-        return { ...acc, score: est, scoreEstimated: true };
+        return { ...acc, score: estimateScoreFromFollowers(acc.followers), scoreEstimated: true };
       });
 
       allScored     = [...allScored, ...batchScored];
       totalNonZero  = allScored.filter((c) => c.score > 0 && !c.scoreEstimated).length;
       totalEstimated = allScored.filter((c) => c.scoreEstimated).length;
 
-      // ── Per-stage debug counts ────────────────────────────────────────────────
-      const afterScoreGate = allScored.filter((c) => c.score > profileScore);
-      console.log(`  After round ${round + 1}:`);
-      console.log(`    Real scores (non-zero) : ${totalNonZero}`);
-      console.log(`    Estimated scores       : ${totalEstimated}`);
-      console.log(`    Passing score gate     : ${afterScoreGate.length}  (score > ${profileScore})`);
-      console.log(`    Already-followed in pool: ${afterScoreGate.filter((c) => c.userFollows).length}`);
+      const strongFollowed = allScored.filter((c) => c.userFollows && c.score > profileScore);
+      console.log(`  Round ${round + 1} done: realScores=${totalNonZero}  estimated=${totalEstimated}  strongFollowed=${strongFollowed.length} (score>ps + follows)`);
 
-      filtered = fillSlots(allScored, base, profileScore);
-      console.log(`    fillSlots result       : ${filtered.length} candidate(s)`);
-
-      if (filtered.length >= 5) break;
-      if (round < MAX_ROUNDS - 1) {
-        console.log(`  < 5 results — expanding to round ${round + 2}…`);
+      // Early-stop ONLY if we already have 5+ strong already-followed candidates.
+      // Relaxed candidates (below profileScore) are NOT counted for this check —
+      // we always prefer to keep scoring in hopes of finding stronger results.
+      if (strongFollowed.length >= 5) {
+        console.log(`  ✓ ${strongFollowed.length} strong followed candidates found — stopping early`);
+        break;
+      }
+      if (round < MAX_ROUNDS - 1 && batch.length === ROUND_SIZE) {
+        console.log(`  < 5 strong candidates — continuing to round ${round + 2}…`);
       }
     }
+
+    // Apply slot filling once on the FULL scored pool.
+    filtered = fillSlots(allScored, base, profileScore);
+    console.log(`\n[scan] fillSlots on full pool of ${allScored.length}: ${filtered.length} candidate(s)`);
 
     // ── 6b. Pass D: reverse-follow fallback ───────────────────────────────────
     // Triggered when the primary follow-graph pool yielded < 5 results.
@@ -889,6 +954,82 @@ export async function GET(
     }
 
     if (!exhausted && filtered.length < 5) exhausted = true;
+
+    // ── 6d. Graph-missing niche fallback ──────────────────────────────────────
+    // Triggered when the follow graph is completely empty but a profileScore exists.
+    // (@zaimiri scenario: Sorsa has a score but no /follows or /followers data.)
+    // Try Sorsa's niche/similarity endpoints to surface accounts from the same
+    // topic cluster as a "Topic Match" replacement for empty results.
+    const hasGraphData = following.length > 0 || followers.length > 0;
+    let graphMissingFallbackUsed = false;
+    let nicheAccounts: NormalisedAccount[] = [];
+
+    if (!hasGraphData && profileScore > 0 && filtered.length < 5) {
+      graphMissingFallbackUsed = true;
+      console.log(`\n[scan] ── Graph-missing niche fallback: trying /similar, /related, /peers…`);
+
+      const nicheEndpoints = [
+        `/similar?username=${enc}`,
+        `/related?username=${enc}`,
+        `/peers?username=${enc}`,
+      ];
+
+      for (const ep of nicheEndpoints) {
+        if (nicheAccounts.length >= 20) break;
+        try {
+          const raw   = await sorsaFetch(ep);
+          const batch = extractList(raw);
+          console.log(`  ${ep}: got ${batch.length} accounts`);
+          for (const acc of batch) {
+            const uLow = acc.username.toLowerCase().replace(/^@/, "");
+            if (!uLow) continue;
+            if (nicheAccounts.some((a) => a.username === uLow)) continue;
+            nicheAccounts.push({ ...acc, username: uLow, userFollows: false });
+          }
+        } catch (e) {
+          console.log(`  ${ep}: failed — ${e}`);
+        }
+      }
+
+      console.log(`  Niche accounts found: ${nicheAccounts.length}`);
+
+      if (nicheAccounts.length > 0) {
+        // Filter, score, then fill remaining slots with progressive floors
+        const nicheFiltered = nicheAccounts
+          .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
+          .sort((a, b) => b.followers - a.followers)
+          .slice(0, 50);
+
+        const nicheRaw    = await Promise.all(nicheFiltered.map((acc) => fetchScore(acc.username)));
+        const nicheScored = nicheFiltered.map((acc, i) => {
+          const real = nicheRaw[i];
+          return {
+            ...acc,
+            score:          real > 0 ? real : estimateScoreFromFollowers(acc.followers),
+            scoreEstimated: real === 0,
+          };
+        });
+
+        const alreadyUsedNiche = new Set(filtered.map((c) => c.username.toLowerCase()));
+        const nicheFloors = [profileScore, profileScore * 0.80, profileScore * 0.60, profileScore * 0.40, 0];
+        for (const floor of nicheFloors) {
+          if (filtered.length >= 5) break;
+          const valid = nicheScored
+            .filter(isValid)
+            .filter((c) => c.score > 0)
+            .filter((c) => c.score > floor)
+            .filter((c) => !alreadyUsedNiche.has(c.username.toLowerCase()))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5 - filtered.length);
+          for (const c of valid) {
+            const tier: Tier = c.score > profileScore ? 1 : (c.score > profileScore * 0.75 ? 2 : 3);
+            filtered.push({ ...c, tier });
+            alreadyUsedNiche.add(c.username.toLowerCase());
+          }
+        }
+        console.log(`  Niche fallback total now: ${filtered.length} candidate(s)`);
+      }
+    }
 
     // ── 7. Debug summary ──────────────────────────────────────────────────────
     const seenLog  = new Set<string>();
@@ -1008,20 +1149,35 @@ export async function GET(
       }));
 
     const debugInfo = {
-      profileScore:            Math.round(profileScore),
-      followingApiCount:       following.length,
-      followersApiCount:       followers.length,
-      followedByUserCount:     nonFollowbacks.length,
-      secondHopCount:          secondHopAccounts.length,
-      totalCandidatePool:      candidateList.length,
-      afterScoreFilter:        afterScoreFilter.length,
-      afterScoreFilterFollows: afterScoreFilter.filter((c) => c.userFollows).length,
-      realScores:              allScored.filter((c) => c.score > 0 && !c.scoreEstimated).length,
-      estimatedScores:         allScored.filter((c) => c.scoreEstimated).length,
-      brandFilteredCount:      brandFiltered.length,
-      brandFilteredAccounts:   brandFiltered,
-      finalCandidateUsernames: validated.map((c) => `@${c.username}`),
-      top20BeforeSlice:        top20,
+      // ── Profile ────────────────────────────────────────────────────────────
+      profileScore:                Math.round(profileScore),
+      // ── Graph fetch counts (all pages) ────────────────────────────────────
+      followingApiCount:           following.length,
+      followersApiCount:           followers.length,
+      // ── Candidate pool stages ─────────────────────────────────────────────
+      candidatePoolFromFollowing:  nonFollowbacks.length,
+      candidatePoolFromSecondHop:  secondHopAccounts.length,
+      candidatePoolFromNiche:      nicheAccounts.length,
+      afterFollowBackRemoval:      nonFollowbacks.length,     // primary pool = already excludes follow-backs
+      afterBlacklist:              candidateList.length,      // after brand/org filter applied
+      afterScoring:                allScored.length,          // how many were actually scored
+      // ── Score counts ──────────────────────────────────────────────────────
+      afterScoreFilter:            afterScoreFilter.length,   // scored AND score > profileScore
+      afterScoreFilterFollows:     afterScoreFilter.filter((c) => c.userFollows).length,
+      realScores:                  allScored.filter((c) => c.score > 0 && !c.scoreEstimated).length,
+      estimatedScores:             allScored.filter((c) => c.scoreEstimated).length,
+      // ── Final result breakdown ─────────────────────────────────────────────
+      finalTier1Count:             tierCounts[1],
+      finalTier2Count:             tierCounts[2],
+      finalTier3Count:             tierCounts[3],
+      finalCandidateUsernames:     validated.map((c) => `@${c.username}`),
+      // ── Fallback flags ────────────────────────────────────────────────────
+      fallbackModeUsed:            fallbackUsed,
+      graphMissingFallbackUsed,
+      // ── Diagnostics ───────────────────────────────────────────────────────
+      brandFilteredCount:          brandFiltered.length,
+      brandFilteredAccounts:       brandFiltered,
+      top20BeforeSlice:            top20,
     };
 
     console.log(`\n[scan] DEBUG INFO:`);
@@ -1030,9 +1186,11 @@ export async function GET(
     // ── 10. Empty state ───────────────────────────────────────────────────────
     if (validated.length === 0) {
       // Distinguish between "no graph data" and "graph exists but no matches"
-      const hasGraphData = following.length > 0 || followers.length > 0;
+      // (hasGraphData is declared above in the niche-fallback block)
       const emptyMessage = !hasGraphData && profileScore > 0
-        ? "Follow network not indexed yet — Sorsa has your score but no follow graph data. Try again in a few hours."
+        ? graphMissingFallbackUsed
+          ? "Follow network not indexed yet — niche similarity search also returned no scoreable candidates. Try again in a few hours."
+          : "Follow network not indexed yet — Sorsa has your score but no follow graph data. Try again in a few hours."
         : "No follow-back candidates found in your current network.";
 
       return NextResponse.json({
