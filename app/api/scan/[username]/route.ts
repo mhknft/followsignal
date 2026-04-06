@@ -391,84 +391,71 @@ function fillSlots(
   const slotDefs = isHigh ? SLOT_DEFS_HIGH  : SLOT_DEFS_STANDARD;
   const widen    = isHigh ? WIDEN_HIGH       : WIDEN_STANDARD;
 
-  // Already-followed accounts get a virtual score boost for slot selection.
-  // This makes them rank higher among eligible candidates since the user
-  // following them is a strong signal they are plausible follow-back targets.
-  // The boost only affects slot matching/ordering — real Sorsa score is used for display
-  // and the final validation gate still enforces score > profileScore (real score).
+  // Already-followed accounts get a virtual score boost so they are prioritised
+  // over 2nd-hop accounts at every tier.  Boost only affects selection order —
+  // real Sorsa score is what gets displayed.
   const FOLLOW_BOOST = 200;
   const effectiveScore = (c: NormalisedAccount) => c.score + (c.userFollows ? FOLLOW_BOOST : 0);
 
-  // Primary eligibility: real score must be strictly above profileScore.
-  // The final validation gate enforces this anyway, so we pre-filter here
-  // to avoid wasting slot capacity on candidates that will be rejected later.
-  const minEligible = profileScore + 1;
-
-  const dedupSeen = new Set<string>();
-  function dedup(c: NormalisedAccount): boolean {
-    const k = c.username.toLowerCase();
-    if (dedupSeen.has(k)) return false;
-    dedupSeen.add(k);
-    return true;
-  }
-
-  const eligible = allScored
-    .filter(isValid)
-    .filter((c) => c.score > 0)
-    // Score floor: already-followed accounts are accepted from 600 (they may have only
-    // a follower-based estimate); 2nd-hop accounts still require 800.
-    .filter((c) => c.score >= (c.userFollows ? 600 : 800))
-    .filter((c) => c.score >= minEligible) // must beat profileScore — final gate re-checks
-    .filter(dedup);
-
   const used = new Set<string>();
+  const usedKey = (c: NormalisedAccount) => c.username.toLowerCase();
   const pool: ScoredAccount[] = [];
 
-  // ── Pass A: one candidate per slot — uses effectiveScore for window matching ─
-  // Already-followed accounts appear in lower slots (higher priority) because
-  // their effective score is boosted, so they get picked before 2nd-hop accounts.
-  for (const def of slotDefs) {
-    const found = findForSlot(eligible, used, base, def, widen, effectiveScore);
-    if (found) {
-      used.add(found.username);
-      pool.push({ ...found, tier: def.tier });
-    }
-  }
-
-  // ── Pass B: greedy fill from leftover eligible (ascending effectiveScore) ────
-  if (pool.length < 5) {
-    const remaining = eligible
-      .filter((c) => !used.has(c.username))
-      .sort((a, b) => effectiveScore(a) - effectiveScore(b));
-    for (const c of remaining) {
-      if (pool.length >= 5) break;
-      used.add(c.username);
-      pool.push({ ...c, tier: 3 });
-    }
-  }
-
-  // ── Pass C: last resort — any valid scored account above profileScore ────────
-  // Only reaches here when passes A+B can't fill 5 slots from the ideal windows.
-  // Still enforces: real score must be > profileScore (never lower/equal).
-  // Prioritises already-followed accounts (effectiveScore desc) for natural ordering.
-  if (pool.length < 5) {
-    const seenC = new Set<string>();
-    const lastResort = allScored
+  // Helper: deduplicated view of allScored filtered to a minimum score floor.
+  function eligibleAbove(floor: number): NormalisedAccount[] {
+    const seen = new Set<string>();
+    return allScored
       .filter(isValid)
       .filter((c) => c.score > 0)
-      .filter((c) => c.score >= (c.userFollows ? 600 : 800))
-      .filter((c) => c.score > profileScore)  // strict: must beat searched profile
+      .filter((c) => effectiveScore(c) > floor)
       .filter((c) => {
-        const k = c.username.toLowerCase();
-        if (used.has(k) || seenC.has(k)) return false;
-        seenC.add(k);
+        const k = usedKey(c);
+        if (used.has(k) || seen.has(k)) return false;
+        seen.add(k);
         return true;
-      })
-      .sort((a, b) => effectiveScore(b) - effectiveScore(a)); // already-followed accounts first
-    for (const c of lastResort) {
+      });
+  }
+
+  // ── Pass A: slot-based with progressive widening — strict gate (> profileScore) ─
+  {
+    const strict = eligibleAbove(profileScore);
+    for (const def of slotDefs) {
+      const found = findForSlot(strict, used, base, def, widen, effectiveScore);
+      if (found) { used.add(usedKey(found)); pool.push({ ...found, tier: def.tier }); }
+    }
+  }
+
+  // ── Pass B: greedy fill from anything still above profileScore ────────────────
+  if (pool.length < 5) {
+    const remaining = eligibleAbove(profileScore)
+      .sort((a, b) => effectiveScore(b) - effectiveScore(a));
+    for (const c of remaining) {
       if (pool.length >= 5) break;
-      used.add(c.username);
+      used.add(usedKey(c));
       pool.push({ ...c, tier: 3 });
+    }
+  }
+
+  // ── Passes C–F: progressive relaxation — triggered only when < 5 found ───────
+  // Each pass lowers the effective-score floor by 20 % of profileScore so we
+  // always surface the best nearby candidates rather than returning blank cards.
+  // Already-followed accounts dominate each pass because of FOLLOW_BOOST.
+  if (pool.length < 5) {
+    const floors = [
+      profileScore * 0.80,   // Pass C — within 20 % below
+      profileScore * 0.60,   // Pass D — within 40 % below
+      profileScore * 0.40,   // Pass E — within 60 % below
+      0,                     // Pass F — absolute floor: any score > 0
+    ];
+    for (const floor of floors) {
+      if (pool.length >= 5) break;
+      const relaxed = eligibleAbove(floor)
+        .sort((a, b) => effectiveScore(b) - effectiveScore(a));
+      for (const c of relaxed) {
+        if (pool.length >= 5) break;
+        used.add(usedKey(c));
+        pool.push({ ...c, tier: 3 });
+      }
     }
   }
 
@@ -869,17 +856,18 @@ export async function GET(
     console.log(`  Returned: ${filtered.map((c) => `@${c.username}`).join(", ")}`);
     console.log(`${"═".repeat(60)}\n`);
 
-    // ── 9b. STRICT FINAL VALIDATION GATE ──────────────────────────────────────
-    // Every candidate in `filtered` must pass all four rules before being shown.
-    // Any that fail are logged and dropped; we never show an invalid suggestion.
-    //
-    // Rules (cannot be relaxed):
-    //   1. Has a non-empty username
-    //   2. Has score > profileScore (strictly higher — never equal or lower)
-    //   3. Not in the follower set (not already following back)
+    // ── 9b. FINAL VALIDATION GATE ────────────────────────────────────────────────
+    // Hard rules that can never be relaxed:
+    //   1. Non-empty username
+    //   2. Score > 0  (zero = no data at all; estimated scores are already > 0)
+    //   3. Not already following back
     //   4. Not blacklisted
-    //   5. Unique (no duplicate usernames in final output)
+    //   5. Unique
     //
+    // NOTE: score > profileScore is NOT enforced here.  Progressive relaxation in
+    // fillSlots already handles ordering — the top candidates are shown regardless
+    // of whether they beat profileScore exactly.  Rejecting them here would produce
+    // blank cards, which is worse than showing the best available match.
     console.log(`\n[scan] ── FINAL VALIDATION GATE (${filtered.length} candidates) ──`);
     console.log(`  Searched username : @${username}`);
     console.log(`  Searched score   : ${profileScore}`);
@@ -897,21 +885,22 @@ export async function GET(
         console.log(`  REJECT @${key}: duplicate`);
         return false;
       }
-      if (c.score <= profileScore) {
-        console.log(`  REJECT @${key}: score ${c.score} <= searched score ${profileScore}`);
+      if (c.score <= 0) {
+        console.log(`  REJECT @${key}: score is 0 (no data)`);
         return false;
       }
       if (followsBackSet.has(key)) {
-        console.log(`  REJECT @${key}: already follows back (in follower set)`);
+        console.log(`  REJECT @${key}: already follows back`);
         return false;
       }
       if (isFiltered(c.name, key, c.followers)) {
-        console.log(`  REJECT @${key}: blacklisted`);
+        console.log(`  REJECT @${key}: brand/org filter`);
         return false;
       }
 
       finalSeen.add(key);
-      console.log(`  PASS   @${key}: score=${c.score}${c.scoreEstimated ? " (estimated)" : ""} userFollows=${c.userFollows}`);
+      const aboveProfile = c.score > profileScore ? "✓above" : `↓${Math.round(profileScore - c.score)}below`;
+      console.log(`  PASS   @${key}: score=${Math.round(c.score)}${c.scoreEstimated ? "(est)" : ""} [${aboveProfile}] follows=${c.userFollows}`);
       return true;
     });
 
@@ -919,8 +908,31 @@ export async function GET(
 
     // ── Build debug info (returned in every response for diagnostics) ─────────
     const afterScoreFilter = allScored.filter((c) => c.score > profileScore);
+    // Which accounts did the brand/org filter drop?
+    const brandFiltered = combinedPool
+      .filter((acc) => isFiltered(acc.name, acc.username, acc.followers))
+      .map((acc) => ({ u: acc.username, name: acc.name, followers: acc.followers }));
+
+    // Top 20 candidates by effectiveScore before slicing to 5
+    const FOLLOW_BOOST_DBG = 200;
+    const effScoreDbg = (c: NormalisedAccount) => c.score + (c.userFollows ? FOLLOW_BOOST_DBG : 0);
+    const top20 = [...allScored]
+      .filter(isValid)
+      .filter((c) => c.score > 0)
+      .filter((c) => !followsBackSet.has(c.username.toLowerCase()))
+      .sort((a, b) => effScoreDbg(b) - effScoreDbg(a))
+      .slice(0, 20)
+      .map((c) => ({
+        u:         c.username,
+        score:     Math.round(c.score),
+        effScore:  Math.round(effScoreDbg(c)),
+        estimated: !!c.scoreEstimated,
+        follows:   c.userFollows,
+        aboveProfile: c.score > profileScore,
+      }));
+
     const debugInfo = {
-      profileScore,
+      profileScore:            Math.round(profileScore),
       followedByUserCount:     nonFollowbacks.length,
       secondHopCount:          secondHopAccounts.length,
       totalCandidatePool:      candidateList.length,
@@ -928,12 +940,10 @@ export async function GET(
       afterScoreFilterFollows: afterScoreFilter.filter((c) => c.userFollows).length,
       realScores:              allScored.filter((c) => c.score > 0 && !c.scoreEstimated).length,
       estimatedScores:         allScored.filter((c) => c.scoreEstimated).length,
-      filteredByTier6Brand:    combinedPool.filter((acc) => isFiltered(acc.name, acc.username, acc.followers)).length,
+      brandFilteredCount:      brandFiltered.length,
+      brandFilteredAccounts:   brandFiltered,
       finalCandidateUsernames: validated.map((c) => `@${c.username}`),
-      top20BeforeSlice:        afterScoreFilter
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 20)
-        .map((c) => ({ u: c.username, score: Math.round(c.score), estimated: !!c.scoreEstimated, follows: c.userFollows })),
+      top20BeforeSlice:        top20,
     };
 
     console.log(`\n[scan] DEBUG INFO:`);
