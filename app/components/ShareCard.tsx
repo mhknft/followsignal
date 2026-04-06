@@ -5,7 +5,7 @@ import { motion } from "framer-motion";
 import Image from "next/image";
 import type { PredictedAccount, SearchedProfile } from "../types";
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatScore(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -13,49 +13,93 @@ function formatScore(n: number): string {
   return Math.round(n).toString();
 }
 
-// ─── Layout constants ────────────────────────────────────────────────────────
+// ─── Layout constants ─────────────────────────────────────────────────────────
+// Rendered at 600 × 315 px; html-to-image exports at ×2 → 1200 × 630 (X card).
 
-const CARD_W = 520;
-const CARD_H = 340;
+const CARD_W = 600;
+const CARD_H = 315;
+const CX     = 300;  // orbit center — pixels
+const CY     = 157;
 
-// Center of the constellation (as %)
-const CX = 50;
-const CY = 44;
+// Center profile
+const CENTER_SIZE   = 72;  // outer ring container (px) — ~23 % smaller than old 94 px
+const CENTER_AVATAR = 60;  // inner avatar diameter
 
-// Orbit positions for each recommendation card (% of card width / height)
-const ORBIT_POS: Record<string, { x: number; y: number }> = {
-  "top-left":      { x: 20, y: 14 },
-  "top-right":     { x: 80, y: 14 },
-  "lower-left":    { x: 12, y: 75 },
-  "lower-right":   { x: 88, y: 75 },
-  "bottom-center": { x: 50, y: 90 },
+// Mini-card dimensions (px)
+const MINI_W = 104;
+const MINI_H = 62;
+
+// ─── Orbit slot positions ─────────────────────────────────────────────────────
+// Keys must match acc.position values emitted by the scan API.
+// Each value is the CENTRE of the mini-card in card-space pixels.
+// All cards verified: no edge within 55 px of card boundary.
+//
+//  top-left      (182, 80)  → edges L:130  R:234  T:49  B:111
+//  top-right     (418, 80)  → edges L:366  R:470  T:49  B:111
+//  lower-left    (112,160)  → edges L:60   R:164  T:129 B:191
+//  lower-right   (488,160)  → edges L:436  R:540  T:129 B:191
+//  bottom-center (300,257)  → edges L:248  R:352  T:226 B:288
+
+const ORBIT_SLOTS: Record<string, { x: number; y: number }> = {
+  "top-left":      { x: 182, y: 80  },
+  "top-right":     { x: 418, y: 80  },
+  "lower-left":    { x: 112, y: 160 },
+  "lower-right":   { x: 488, y: 160 },
+  "bottom-center": { x: 300, y: 257 },
 };
 
-// ─── Background stars (deterministic — same every render) ───────────────────
+// ─── Decorative rings ─────────────────────────────────────────────────────────
 
-const STARS = Array.from({ length: 48 }, (_, i) => ({
+const RING_RX = 165;  // outer orbit ellipse — horizontal radius
+const RING_RY = 103;  // outer orbit ellipse — vertical radius
+const RING2_R =  88;  // inner micro-circle radius
+
+// ─── Star field (deterministic — identical on every render) ──────────────────
+
+const STARS = Array.from({ length: 42 }, (_, i) => ({
   id: i,
-  x: ((i * 137.508) % 100).toFixed(2),
-  y: ((i * 97.391 + 13) % 100).toFixed(2),
-  r: i % 4 === 0 ? 1.4 : i % 4 === 1 ? 1.0 : i % 4 === 2 ? 0.7 : 0.5,
-  o: (0.12 + (i % 6) * 0.055).toFixed(3),
+  cx: ((i * 137.508 + 11) % 100).toFixed(2),
+  cy: ((i * 97.391  + 29) % 100).toFixed(2),
+  r:  i % 5 === 0 ? 1.2 : i % 5 === 1 ? 0.85 : i % 5 === 2 ? 0.6 : i % 5 === 3 ? 0.42 : 0.28,
+  o:  (0.08 + (i % 7) * 0.038).toFixed(3),
 }));
 
-// ─── Component ───────────────────────────────────────────────────────────────
+// ─── Spoke endpoints ──────────────────────────────────────────────────────────
+// Draws a short radial segment from just outside the center avatar ring
+// toward the card position — ending before it reaches the card.
+// Spokes are purely radial so they can never cross each other.
+
+function getSpokeEndpoints(slotX: number, slotY: number) {
+  const dx   = slotX - CX;
+  const dy   = slotY - CY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const ux   = dx / dist;
+  const uy   = dy / dist;
+
+  const r0 = CENTER_SIZE / 2 + 6;                        // start: just past ring edge
+  const r1 = Math.max(r0 + 10, Math.min(r0 + 55, dist - 56)); // end: before card edge
+
+  return {
+    x1: CX + ux * r0, y1: CY + uy * r0,
+    x2: CX + ux * r1, y2: CY + uy * r1,
+  };
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 interface ShareCardProps {
-  username?: string;
-  predictions: PredictedAccount[] | null;
+  username?:       string;
+  predictions:     PredictedAccount[] | null;
   searchedProfile?: SearchedProfile | null;
 }
 
 export default function ShareCard({ username, predictions, searchedProfile }: ShareCardProps) {
-  const cardRef      = useRef<HTMLDivElement>(null);
-  const [isExporting,  setIsExporting]  = useState(false);
-  const [isCapturing,  setIsCapturing]  = useState(false);
-  const [exportError,  setExportError]  = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [exportError, setExportError] = useState(false);
 
-  // ── Image proxy (avoids CORS during export) ────────────────────────────────
+  // ── Image proxy (bypasses CORS for Twitter CDN avatars) ────────────────────
   async function proxyToDataUrl(src: string): Promise<string> {
     const res = await fetch(`/api/proxy-image?url=${encodeURIComponent(src)}`);
     if (!res.ok) throw new Error(`proxy ${res.status}`);
@@ -68,7 +112,7 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
     });
   }
 
-  // ── Export handler ─────────────────────────────────────────────────────────
+  // ── Download handler ────────────────────────────────────────────────────────
   const handleDownload = useCallback(async () => {
     const el = cardRef.current;
     if (!el || isExporting) return;
@@ -80,7 +124,7 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
     const origSrcs = imgs.map((img) => img.src);
 
     try {
-      // Pre-fetch every avatar through the server proxy → base64 data URL.
+      // Swap all img srcs to base64 data URLs (avoids CORS during canvas capture).
       await Promise.allSettled(
         imgs.map(async (img, i) => {
           try {
@@ -91,16 +135,16 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
               img.onload  = () => resolve();
               img.onerror = () => resolve();
             });
-          } catch { /* leave original src — placeholder will show */ }
+          } catch { /* keep original src — fallback placeholder will render */ }
         }),
       );
 
-      // Freeze all Framer Motion animations to their rest position.
+      // Freeze all Framer Motion animations at rest position.
       setIsCapturing(true);
       await new Promise<void>((r) => setTimeout(r, 120));
 
       const { toPng } = await import("html-to-image");
-      const pixelRatio = Math.max(2, 1200 / el.offsetWidth);
+      const pixelRatio = Math.max(2, 1200 / el.offsetWidth);  // → 1200 px wide export
 
       const dataUrl = await toPng(el, {
         cacheBust:        false,
@@ -112,7 +156,7 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
 
       const link = document.createElement("a");
       link.download = `followsignal-${username ?? "card"}.png`;
-      link.href = dataUrl;
+      link.href     = dataUrl;
       link.click();
     } catch {
       setExportError(true);
@@ -123,11 +167,11 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
     }
   }, [isExporting, username]);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <section className="relative z-30 mt-24 mb-16 flex flex-col items-center px-4">
 
-      {/* ── Section label ──────────────────────────────────────────────────── */}
+      {/* Section label */}
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -145,405 +189,394 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
         </p>
       </motion.div>
 
-      {/* ── Card preview ───────────────────────────────────────────────────── */}
+      {/* Card preview wrapper */}
       <motion.div
-        initial={{ opacity: 0, scale: 0.9, y: 30 }}
+        initial={{ opacity: 0, scale: 0.92, y: 30 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ duration: 1, delay: 1.6, ease: [0.16, 1, 0.3, 1] }}
         className="relative mb-8"
         style={{ maxWidth: "100%" }}
       >
-        {/* Outer glow halo */}
+        {/* Ambient outer glow */}
         <div
-          className="absolute inset-0 rounded-3xl pointer-events-none"
+          aria-hidden
           style={{
-            background: "radial-gradient(ellipse at 50% 50%, rgba(139,92,246,0.55) 0%, transparent 70%)",
-            filter: "blur(48px)",
-            transform: "scale(1.3)",
-            zIndex: -1,
+            position:     "absolute",
+            inset:        "-48px",
+            borderRadius: "48px",
+            background:   "radial-gradient(ellipse at 50% 50%, rgba(139,92,246,0.42) 0%, transparent 68%)",
+            filter:       "blur(44px)",
+            pointerEvents:"none",
+            zIndex:       -1,
           }}
         />
 
-        {/* Glass frame */}
+        {/* Glass border frame */}
         <div
-          className="p-[10px] rounded-3xl"
           style={{
-            background: "linear-gradient(135deg, rgba(255,255,255,0.06) 0%, rgba(139,92,246,0.04) 100%)",
-            border: "1px solid rgba(139,92,246,0.3)",
-            boxShadow: "0 12px 60px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.03) inset",
+            padding:     8,
+            borderRadius:20,
+            background:  "linear-gradient(135deg, rgba(255,255,255,0.055) 0%, rgba(139,92,246,0.03) 100%)",
+            border:      "1px solid rgba(139,92,246,0.26)",
+            boxShadow:   "0 20px 70px rgba(0,0,0,0.8), 0 0 0 1px rgba(255,255,255,0.024) inset",
           }}
         >
-
-          {/* ── The actual exportable card ──────────────────────────────── */}
+          {/* ──────────────────────────────────────────────────────────────── */}
+          {/* EXPORTABLE CARD                                                  */}
+          {/* ──────────────────────────────────────────────────────────────── */}
           <div
             ref={cardRef}
             style={{
-              position: "relative",
-              width: CARD_W,
-              height: CARD_H,
-              maxWidth: "100%",
-              borderRadius: 14,
-              overflow: "hidden",
-              background: "linear-gradient(150deg, #07000e 0%, #110022 45%, #08001a 100%)",
+              position:   "relative",
+              width:       CARD_W,
+              height:      CARD_H,
+              maxWidth:   "100%",
+              borderRadius:12,
+              overflow:   "hidden",
+              background: "linear-gradient(150deg, #050011 0%, #0d0024 55%, #040010 100%)",
+              fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
             }}
           >
 
-            {/* ── Layer 0: Stars ─────────────────────────────────────────── */}
+            {/* ── Layer 0: Background nebula glows ────────────────────── */}
+            <div aria-hidden style={{ position:"absolute", inset:0, pointerEvents:"none" }}>
+              <div style={{
+                position:"absolute", left:"-8%", top:"-25%",
+                width:"52%", height:"80%", borderRadius:"50%",
+                background:"radial-gradient(circle, rgba(76,29,149,0.2) 0%, transparent 70%)",
+                filter:"blur(36px)",
+              }} />
+              <div style={{
+                position:"absolute", left:"50%", top:"50%",
+                transform:"translate(-50%,-50%)",
+                width:"65%", height:"95%", borderRadius:"50%",
+                background:"radial-gradient(circle, rgba(109,40,217,0.28) 0%, rgba(79,70,229,0.08) 45%, transparent 70%)",
+                filter:"blur(24px)",
+              }} />
+              <div style={{
+                position:"absolute", right:"-5%", bottom:"-15%",
+                width:"38%", height:"55%", borderRadius:"50%",
+                background:"radial-gradient(circle, rgba(49,16,101,0.16) 0%, transparent 70%)",
+                filter:"blur(28px)",
+              }} />
+            </div>
+
+            {/* ── Layer 1: Star field ──────────────────────────────────── */}
             <svg
-              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
-              aria-hidden="true"
+              aria-hidden
+              style={{ position:"absolute", inset:0, width:"100%", height:"100%", pointerEvents:"none" }}
             >
               {STARS.map((s) => (
-                <circle key={s.id} cx={`${s.x}%`} cy={`${s.y}%`} r={s.r} fill="white" opacity={s.o} />
+                <circle key={s.id} cx={`${s.cx}%`} cy={`${s.cy}%`} r={s.r} fill="white" opacity={s.o} />
               ))}
             </svg>
 
-            {/* ── Layer 1: Radial background glow behind center ─────────── */}
-            <div
-              style={{
-                position: "absolute",
-                left: `${CX}%`,
-                top: `${CY}%`,
-                transform: "translate(-50%, -50%)",
-                width: 280,
-                height: 280,
-                borderRadius: "50%",
-                background: "radial-gradient(circle, rgba(120,40,240,0.45) 0%, rgba(80,20,180,0.18) 45%, transparent 70%)",
-                filter: "blur(18px)",
-                pointerEvents: "none",
-              }}
-            />
-
-            {/* ── Layer 2: Orbit lines (SVG) ─────────────────────────────── */}
+            {/* ── Layer 2: Orbit rings + spoke lines (SVG) ─────────────── */}
             <svg
-              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
-              aria-hidden="true"
+              aria-hidden
+              style={{ position:"absolute", inset:0, width:"100%", height:"100%", overflow:"visible", pointerEvents:"none" }}
             >
               <defs>
                 {(predictions ?? []).map((acc, i) => {
-                  const pos = ORBIT_POS[acc.position] ?? { x: 50, y: 50 };
+                  const slot = ORBIT_SLOTS[acc.position];
+                  if (!slot) return null;
+                  const sp = getSpokeEndpoints(slot.x, slot.y);
                   return (
                     <linearGradient
-                      key={`grad-${i}`}
-                      id={`lg${i}`}
-                      x1={`${CX}%`} y1={`${CY}%`}
-                      x2={`${pos.x}%`} y2={`${pos.y}%`}
+                      key={`sg${i}`}
+                      id={`spoke-g-${i}`}
+                      x1={sp.x1} y1={sp.y1}
+                      x2={sp.x2} y2={sp.y2}
                       gradientUnits="userSpaceOnUse"
                     >
-                      <stop offset="0%"   stopColor="rgba(168,85,247,0.9)" />
-                      <stop offset="60%"  stopColor="rgba(139,92,246,0.35)" />
-                      <stop offset="100%" stopColor="rgba(99,102,241,0.15)" />
+                      <stop offset="0%"   stopColor="rgba(168,85,247,0.8)"  />
+                      <stop offset="100%" stopColor="rgba(139,92,246,0.03)" />
                     </linearGradient>
                   );
                 })}
               </defs>
 
+              {/* Outer orbit ellipse (decorative) */}
+              <ellipse
+                cx={CX} cy={CY} rx={RING_RX} ry={RING_RY}
+                fill="none"
+                stroke="rgba(139,92,246,0.11)"
+                strokeWidth={0.75}
+                strokeDasharray="3 11"
+              />
+
+              {/* Inner micro ring (adds depth) */}
+              <circle
+                cx={CX} cy={CY} r={RING2_R}
+                fill="none"
+                stroke="rgba(168,85,247,0.065)"
+                strokeWidth={0.6}
+                strokeDasharray="2 9"
+              />
+
+              {/* Radial spoke segments — purely outward, never crossing */}
               {(predictions ?? []).map((acc, i) => {
-                const pos = ORBIT_POS[acc.position] ?? { x: 50, y: 50 };
-                const x1 = (CX / 100) * CARD_W;
-                const y1 = (CY / 100) * CARD_H;
-                const x2 = (pos.x / 100) * CARD_W;
-                const y2 = (pos.y / 100) * CARD_H;
+                const slot = ORBIT_SLOTS[acc.position];
+                if (!slot) return null;
+                const sp = getSpokeEndpoints(slot.x, slot.y);
                 return (
-                  <g key={`line-${i}`}>
-                    {/* Solid gradient line */}
-                    <line
-                      x1={x1} y1={y1} x2={x2} y2={y2}
-                      stroke={`url(#lg${i})`}
-                      strokeWidth="0.9"
-                    />
-                    {/* Dashed overlay for depth */}
-                    <line
-                      x1={x1} y1={y1} x2={x2} y2={y2}
-                      stroke="rgba(168,85,247,0.25)"
-                      strokeWidth="0.6"
-                      strokeDasharray="3 7"
-                    />
-                  </g>
+                  <line
+                    key={`spoke-${i}`}
+                    x1={sp.x1} y1={sp.y1}
+                    x2={sp.x2} y2={sp.y2}
+                    stroke={`url(#spoke-g-${i})`}
+                    strokeWidth={0.85}
+                    strokeLinecap="round"
+                  />
                 );
               })}
             </svg>
 
-            {/* ── Layer 3: Center profile ────────────────────────────────── */}
-            <motion.div
+            {/* ── Layer 3: Center profile ──────────────────────────────── */}
+            {/* Outer div handles absolute positioning; inner motion.div floats */}
+            <div
               style={{
-                position: "absolute",
-                left: `${CX}%`,
-                top: `${CY}%`,
-                transform: "translate(-50%, -50%)",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                gap: 5,
-                zIndex: 20,
+                position:"absolute",
+                left: CX, top: CY,
+                transform:"translate(-50%,-50%)",
+                zIndex:20,
               }}
-              animate={isCapturing ? { y: 0 } : { y: [0, -5, 0] }}
-              transition={{ duration: 5, repeat: Infinity, ease: "easeInOut" }}
             >
-              {/* Profile ring + avatar */}
-              <div style={{ position: "relative", width: 94, height: 94 }}>
-                {/* Rotating conic-gradient ring */}
-                <motion.div
-                  style={{
-                    position: "absolute",
-                    inset: -2,
-                    borderRadius: "50%",
-                    background: "conic-gradient(from 0deg, #a855f7 0%, #6366f1 30%, #1e1b4b 55%, #a855f7 100%)",
-                  }}
-                  animate={isCapturing ? { rotate: 0 } : { rotate: 360 }}
-                  transition={{ duration: 5, repeat: Infinity, ease: "linear" }}
-                />
-                {/* Dark inset separator */}
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 2,
-                    borderRadius: "50%",
-                    background: "#07000e",
-                  }}
-                />
-                {/* Avatar */}
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 5,
-                    borderRadius: "50%",
-                    overflow: "hidden",
-                    background: "linear-gradient(135deg, #4c1d95, #1e1b4b)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  {searchedProfile?.avatar ? (
-                    <Image
-                      src={searchedProfile.avatar}
-                      alt={searchedProfile.displayName}
-                      width={84}
-                      height={84}
-                      className="object-cover w-full h-full"
-                      unoptimized
-                    />
-                  ) : searchedProfile ? (
-                    <span style={{ color: "white", fontSize: 26, fontWeight: 900 }}>
-                      {searchedProfile.displayName.charAt(0).toUpperCase()}
+              <motion.div
+                animate={isCapturing ? { y: 0 } : { y: [0, -4, 0] }}
+                transition={{ duration: 5, repeat: Infinity, ease: "easeInOut" }}
+                style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:5 }}
+              >
+                {/* Ring + avatar container */}
+                <div style={{ position:"relative", width:CENTER_SIZE, height:CENTER_SIZE, flexShrink:0 }}>
+
+                  {/* Ambient ring glow */}
+                  <div style={{
+                    position:"absolute", inset:-12, borderRadius:"50%",
+                    background:"radial-gradient(circle, rgba(139,92,246,0.48) 0%, transparent 68%)",
+                    filter:"blur(10px)",
+                  }} />
+
+                  {/* Rotating conic ring */}
+                  <motion.div
+                    animate={isCapturing ? { rotate: 0 } : { rotate: 360 }}
+                    transition={{ duration: 6, repeat: Infinity, ease: "linear" }}
+                    style={{
+                      position:"absolute", inset:-2, borderRadius:"50%",
+                      background:"conic-gradient(from 0deg, #a855f7 0%, #6366f1 35%, #1e1b4b 60%, #a855f7 100%)",
+                    }}
+                  />
+
+                  {/* Dark separator */}
+                  <div style={{
+                    position:"absolute", inset:2, borderRadius:"50%",
+                    background:"#06000f",
+                  }} />
+
+                  {/* Avatar */}
+                  <div style={{
+                    position:"absolute", inset:5, borderRadius:"50%",
+                    overflow:"hidden",
+                    background:"linear-gradient(135deg, #3b0764, #1e1b4b)",
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                  }}>
+                    {searchedProfile?.avatar ? (
+                      <Image
+                        src={searchedProfile.avatar}
+                        alt={searchedProfile.displayName}
+                        width={CENTER_AVATAR}
+                        height={CENTER_AVATAR}
+                        className="object-cover w-full h-full"
+                        unoptimized
+                      />
+                    ) : searchedProfile ? (
+                      <span style={{ color:"white", fontSize:22, fontWeight:900 }}>
+                        {searchedProfile.displayName.charAt(0).toUpperCase()}
+                      </span>
+                    ) : (
+                      <div style={{ width:"100%", height:"100%", background:"rgba(139,92,246,0.08)" }} />
+                    )}
+                  </div>
+
+                  {/* Ring glow shadow */}
+                  <div style={{
+                    position:"absolute", inset:0, borderRadius:"50%",
+                    boxShadow:"0 0 18px rgba(168,85,247,0.5), 0 0 36px rgba(109,40,217,0.2)",
+                    pointerEvents:"none",
+                  }} />
+                </div>
+
+                {/* Name + @username */}
+                <div style={{ textAlign:"center" }}>
+                  <div style={{
+                    color:"rgba(255,255,255,0.92)",
+                    fontSize:10.5, fontWeight:700,
+                    letterSpacing:"0.025em", lineHeight:1.2,
+                    maxWidth:110, overflow:"hidden",
+                    textOverflow:"ellipsis", whiteSpace:"nowrap",
+                  }}>
+                    {searchedProfile?.displayName ?? "—"}
+                  </div>
+                  <div style={{
+                    color:"rgba(168,85,247,0.48)",
+                    fontSize:8.5, marginTop:1,
+                    letterSpacing:"0.01em",
+                  }}>
+                    @{searchedProfile?.username ?? username ?? "—"}
+                  </div>
+                </div>
+
+                {/* Orbit Score badge */}
+                {searchedProfile && (
+                  <div style={{
+                    display:"flex", alignItems:"center", gap:3,
+                    padding:"2.5px 8px", borderRadius:20,
+                    background:"linear-gradient(135deg, rgba(109,40,217,0.42), rgba(79,70,229,0.28))",
+                    border:"1px solid rgba(139,92,246,0.52)",
+                    boxShadow:"0 0 10px rgba(139,92,246,0.28), 0 1px 0 rgba(255,255,255,0.05) inset",
+                  }}>
+                    <span style={{
+                      fontSize:10, fontWeight:900,
+                      background:"linear-gradient(90deg, #c084fc, #818cf8)",
+                      WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
+                    }}>
+                      {formatScore(searchedProfile.score)}
                     </span>
-                  ) : (
-                    <div style={{ width: "100%", height: "100%", background: "rgba(168,85,247,0.08)" }} />
-                  )}
-                </div>
-                {/* Outer glow shadow */}
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    borderRadius: "50%",
-                    boxShadow: "0 0 24px rgba(168,85,247,0.65), 0 0 48px rgba(139,92,246,0.28)",
-                    pointerEvents: "none",
-                  }}
-                />
-              </div>
+                    <span style={{
+                      fontSize:7, color:"rgba(255,255,255,0.26)",
+                      letterSpacing:"0.12em", textTransform:"uppercase",
+                    }}>
+                      Orbit
+                    </span>
+                  </div>
+                )}
+              </motion.div>
+            </div>
 
-              {/* Name */}
-              <div style={{ textAlign: "center" }}>
-                <div style={{
-                  color: "white",
-                  fontSize: 11,
-                  fontWeight: 700,
-                  letterSpacing: "0.02em",
-                  lineHeight: 1.2,
-                }}>
-                  {searchedProfile?.displayName ?? "—"}
-                </div>
-                <div style={{ color: "rgba(168,85,247,0.55)", fontSize: 9, marginTop: 1 }}>
-                  @{searchedProfile?.username ?? username ?? "—"}
-                </div>
-              </div>
-
-              {/* Orbit Score badge */}
-              {searchedProfile && (
-                <div style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 3,
-                  padding: "3px 9px",
-                  borderRadius: 20,
-                  background: "linear-gradient(135deg, rgba(109,40,217,0.35), rgba(79,70,229,0.25))",
-                  border: "1px solid rgba(139,92,246,0.55)",
-                  boxShadow: "0 0 14px rgba(139,92,246,0.35), 0 2px 0 rgba(255,255,255,0.04) inset",
-                }}>
-                  <span style={{
-                    fontSize: 10,
-                    fontWeight: 900,
-                    background: "linear-gradient(90deg, #c084fc, #818cf8)",
-                    WebkitBackgroundClip: "text",
-                    WebkitTextFillColor: "transparent",
-                  }}>
-                    {formatScore(searchedProfile.score)}
-                  </span>
-                  <span style={{
-                    fontSize: 7.5,
-                    color: "rgba(255,255,255,0.3)",
-                    letterSpacing: "0.12em",
-                    textTransform: "uppercase",
-                  }}>
-                    Orbit
-                  </span>
-                </div>
-              )}
-            </motion.div>
-
-            {/* ── Layer 4: Recommendation cards ─────────────────────────── */}
+            {/* ── Layer 4: Recommendation mini-cards ───────────────────── */}
             {(predictions ?? []).map((acc, i) => {
-              const pos = ORBIT_POS[acc.position] ?? { x: 50, y: 50 };
+              const slot = ORBIT_SLOTS[acc.position];
+              if (!slot) return null;
               return (
-                <motion.div
+                /* Outer div: absolute positioning */
+                <div
                   key={acc.id}
                   style={{
-                    position: "absolute",
-                    left: `${pos.x}%`,
-                    top: `${pos.y}%`,
-                    transform: "translate(-50%, -50%)",
-                    zIndex: 20,
+                    position:"absolute",
+                    left: slot.x, top: slot.y,
+                    transform:"translate(-50%,-50%)",
+                    zIndex:20,
                   }}
-                  animate={isCapturing ? { y: 0 } : { y: [0, -2.5, 0] }}
-                  transition={{
-                    duration: 3.5 + i * 0.45,
-                    repeat: Infinity,
-                    ease: "easeInOut",
-                    delay: i * 0.4,
-                  }}
-                  whileHover={{ scale: 1.07, transition: { duration: 0.18 } }}
                 >
-                  {/* Mini card */}
-                  <div
-                    style={{
-                      width: 106,
-                      padding: "7px 8px 8px",
-                      borderRadius: 10,
-                      background: "linear-gradient(145deg, rgba(100,36,210,0.28) 0%, rgba(20,14,60,0.5) 100%)",
-                      border: "1px solid rgba(139,92,246,0.45)",
-                      boxShadow:
-                        "0 6px 24px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04) inset, 0 0 16px rgba(109,40,217,0.18)",
+                  {/* Inner motion.div: floating animation only */}
+                  <motion.div
+                    animate={isCapturing ? { y: 0 } : { y: [0, -2.5, 0] }}
+                    transition={{
+                      duration: 3.6 + i * 0.5,
+                      repeat: Infinity,
+                      ease: "easeInOut",
+                      delay: i * 0.45,
                     }}
                   >
-                    {/* Avatar + name row */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 6 }}>
-                      {/* Avatar */}
-                      <div style={{
-                        width: 24,
-                        height: 24,
-                        borderRadius: "50%",
-                        overflow: "hidden",
-                        flexShrink: 0,
-                        border: "1px solid rgba(139,92,246,0.45)",
-                        background: "linear-gradient(135deg, #4c1d95, #1e1b4b)",
-                      }}>
-                        <Image
-                          src={acc.avatar}
-                          alt={acc.name}
-                          width={24}
-                          height={24}
-                          className="object-cover w-full h-full"
-                          unoptimized
-                        />
-                      </div>
-                      {/* Name + username */}
-                      <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{
+                      width:  MINI_W,
+                      height: MINI_H,
+                      padding:"7px 8px 7px",
+                      borderRadius:9,
+                      background:"linear-gradient(150deg, rgba(76,29,149,0.38) 0%, rgba(12,5,35,0.62) 100%)",
+                      border:"1px solid rgba(139,92,246,0.4)",
+                      boxShadow:[
+                        "0 4px 22px rgba(0,0,0,0.65)",
+                        "0 0 0 1px rgba(255,255,255,0.03) inset",
+                        "0 0 14px rgba(109,40,217,0.2)",
+                      ].join(", "),
+                      backdropFilter:"blur(18px)",
+                      WebkitBackdropFilter:"blur(18px)",
+                      display:"flex",
+                      flexDirection:"column",
+                      justifyContent:"space-between",
+                    }}>
+                      {/* Row 1: avatar + name */}
+                      <div style={{ display:"flex", alignItems:"center", gap:5 }}>
                         <div style={{
-                          color: "rgba(255,255,255,0.92)",
-                          fontSize: 8,
-                          fontWeight: 700,
-                          lineHeight: 1.25,
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
+                          width:22, height:22, borderRadius:"50%",
+                          overflow:"hidden", flexShrink:0,
+                          border:"1px solid rgba(139,92,246,0.38)",
+                          background:"linear-gradient(135deg, #3b0764, #1e1b4b)",
                         }}>
-                          {acc.name}
+                          <Image
+                            src={acc.avatar}
+                            alt={acc.name}
+                            width={22}
+                            height={22}
+                            className="object-cover w-full h-full"
+                            unoptimized
+                          />
                         </div>
-                        <div style={{
-                          color: "rgba(168,85,247,0.52)",
-                          fontSize: 7,
-                          lineHeight: 1.2,
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        }}>
-                          {acc.username}
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{
+                            color:"rgba(255,255,255,0.9)",
+                            fontSize:7.5, fontWeight:700,
+                            lineHeight:1.25,
+                            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                          }}>
+                            {acc.name}
+                          </div>
+                          <div style={{
+                            color:"rgba(168,85,247,0.48)",
+                            fontSize:6.5, lineHeight:1.2,
+                            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                          }}>
+                            @{acc.username.replace(/^@/, "")}
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    {/* Score + category */}
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 4 }}>
-                      <span style={{
-                        fontSize: 9,
-                        fontWeight: 900,
-                        letterSpacing: "0.01em",
-                        background: "linear-gradient(90deg, #c084fc, #818cf8)",
-                        WebkitBackgroundClip: "text",
-                        WebkitTextFillColor: "transparent",
-                        flexShrink: 0,
-                      }}>
-                        {acc.score != null ? formatScore(acc.score) : `${acc.matchPercent}%`}
-                      </span>
-                      <span style={{
-                        fontSize: 6,
-                        fontWeight: 600,
-                        letterSpacing: "0.04em",
-                        textTransform: "uppercase",
-                        padding: "1.5px 5px",
-                        borderRadius: 20,
-                        whiteSpace: "nowrap",
-                        background: acc.isWildcard
-                          ? "rgba(168,85,247,0.28)"
-                          : "rgba(79,70,229,0.22)",
-                        border: acc.isWildcard
-                          ? "1px solid rgba(168,85,247,0.55)"
-                          : "1px solid rgba(99,102,241,0.4)",
-                        color: acc.isWildcard
-                          ? "rgba(220,180,255,0.9)"
-                          : "rgba(165,140,250,0.85)",
-                      }}>
-                        {acc.category}
-                      </span>
+                      {/* Row 2: score + category pill */}
+                      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:3 }}>
+                        <span style={{
+                          fontSize:9, fontWeight:900,
+                          background:"linear-gradient(90deg, #e879f9, #818cf8)",
+                          WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
+                          flexShrink:0,
+                        }}>
+                          {acc.score != null ? formatScore(acc.score) : `${acc.matchPercent}%`}
+                        </span>
+                        <span style={{
+                          fontSize:5.5, fontWeight:600,
+                          letterSpacing:"0.05em", textTransform:"uppercase",
+                          padding:"1.5px 5px", borderRadius:20,
+                          whiteSpace:"nowrap",
+                          background: acc.isWildcard ? "rgba(168,85,247,0.24)" : "rgba(79,70,229,0.2)",
+                          border:     acc.isWildcard ? "1px solid rgba(168,85,247,0.48)" : "1px solid rgba(99,102,241,0.36)",
+                          color:      acc.isWildcard ? "rgba(216,180,254,0.88)" : "rgba(165,140,250,0.82)",
+                        }}>
+                          {acc.category}
+                        </span>
+                      </div>
                     </div>
-                  </div>
-                </motion.div>
+                  </motion.div>
+                </div>
               );
             })}
 
-            {/* ── Layer 5: Header bar ────────────────────────────────────── */}
-            <div
-              style={{
-                position: "absolute",
-                top: 0,
-                left: 0,
-                right: 0,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                padding: "10px 14px",
-                background: "linear-gradient(180deg, rgba(7,0,14,0.85) 0%, transparent 100%)",
-                zIndex: 30,
-                pointerEvents: "none",
-              }}
-            >
-              {/* Logo */}
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {/* ── Layer 5: Header bar ──────────────────────────────────── */}
+            <div style={{
+              position:"absolute", top:0, left:0, right:0,
+              display:"flex", alignItems:"center", justifyContent:"space-between",
+              padding:"11px 16px",
+              background:"linear-gradient(180deg, rgba(5,0,17,0.92) 0%, transparent 100%)",
+              zIndex:30, pointerEvents:"none",
+            }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
                 <div style={{
-                  width: 17,
-                  height: 17,
-                  borderRadius: 5,
-                  background: "linear-gradient(135deg, #7c3aed, #4f46e5)",
-                  boxShadow: "0 0 8px rgba(124,58,237,0.7)",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  flexShrink: 0,
+                  width:16, height:16, borderRadius:5,
+                  background:"linear-gradient(135deg, #7c3aed, #4f46e5)",
+                  boxShadow:"0 0 8px rgba(124,58,237,0.65)",
+                  display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0,
                 }}>
-                  <svg width="9" height="9" viewBox="0 0 10 10" fill="none">
-                    <circle cx="5" cy="5" r="1.5" fill="white" />
+                  <svg width="8" height="8" viewBox="0 0 10 10" fill="none">
+                    <circle cx="5" cy="5"   r="1.5" fill="white" />
                     <circle cx="5" cy="1.5" r="0.9" fill="rgba(255,255,255,0.7)" />
                     <circle cx="5" cy="8.5" r="0.9" fill="rgba(255,255,255,0.7)" />
                     <circle cx="1.5" cy="5" r="0.9" fill="rgba(255,255,255,0.7)" />
@@ -551,72 +584,51 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
                   </svg>
                 </div>
                 <span style={{
-                  fontSize: 10,
-                  fontWeight: 800,
-                  letterSpacing: "0.14em",
-                  textTransform: "uppercase",
-                  background: "linear-gradient(90deg, #c084fc, #818cf8)",
-                  WebkitBackgroundClip: "text",
-                  WebkitTextFillColor: "transparent",
+                  fontSize:9.5, fontWeight:800,
+                  letterSpacing:"0.15em", textTransform:"uppercase",
+                  background:"linear-gradient(90deg, #c084fc, #818cf8)",
+                  WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
                 }}>
                   FollowSignal
                 </span>
               </div>
               <span style={{
-                fontSize: 7.5,
-                color: "rgba(255,255,255,0.22)",
-                letterSpacing: "0.18em",
-                textTransform: "uppercase",
+                fontSize:7, color:"rgba(255,255,255,0.18)",
+                letterSpacing:"0.2em", textTransform:"uppercase",
               }}>
                 AI Network Scan
               </span>
             </div>
 
-            {/* ── Layer 6: Footer ────────────────────────────────────────── */}
-            <div
-              style={{
-                position: "absolute",
-                bottom: 0,
-                left: 0,
-                right: 0,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                padding: "8px 14px",
-                background: "linear-gradient(0deg, rgba(7,0,14,0.85) 0%, transparent 100%)",
-                zIndex: 30,
-                pointerEvents: "none",
-              }}
-            >
+            {/* ── Layer 6: Footer bar ──────────────────────────────────── */}
+            <div style={{
+              position:"absolute", bottom:0, left:0, right:0,
+              display:"flex", alignItems:"center", justifyContent:"space-between",
+              padding:"9px 16px",
+              background:"linear-gradient(0deg, rgba(5,0,17,0.92) 0%, transparent 100%)",
+              zIndex:30, pointerEvents:"none",
+            }}>
               <span style={{
-                fontSize: 7,
-                color: "rgba(255,255,255,0.18)",
-                letterSpacing: "0.1em",
-                textTransform: "uppercase",
+                fontSize:6.5, color:"rgba(255,255,255,0.15)",
+                letterSpacing:"0.12em", textTransform:"uppercase",
               }}>
                 AI Discovered These Follow-Back Opportunities
               </span>
-              <span style={{ fontSize: 7, color: "rgba(180,155,230,0.32)" }}>
-                Built by @mhknft
+              <span style={{ fontSize:6.5, color:"rgba(180,150,230,0.26)" }}>
+                followsignal.app · @mhknft
               </span>
             </div>
 
-            {/* ── Skeleton / loading overlay ─────────────────────────────── */}
+            {/* ── Skeleton overlay ─────────────────────────────────────── */}
             {predictions === null && (
               <div style={{
-                position: "absolute",
-                inset: 0,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                background: "rgba(7,0,14,0.55)",
-                zIndex: 40,
+                position:"absolute", inset:0,
+                display:"flex", alignItems:"center", justifyContent:"center",
+                background:"rgba(5,0,17,0.5)", zIndex:40,
               }}>
                 <span style={{
-                  fontSize: 10,
-                  letterSpacing: "0.22em",
-                  textTransform: "uppercase",
-                  color: "rgba(168,85,247,0.45)",
+                  fontSize:9, letterSpacing:"0.25em",
+                  textTransform:"uppercase", color:"rgba(168,85,247,0.38)",
                 }}>
                   Scanning…
                 </span>
@@ -625,11 +637,10 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
 
           </div>
           {/* /exportable card */}
-
         </div>
       </motion.div>
 
-      {/* ── Download button ─────────────────────────────────────────────────── */}
+      {/* ── Download button ────────────────────────────────────────────────── */}
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -640,21 +651,20 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
           onClick={handleDownload}
           disabled={isExporting || predictions === null}
           whileHover={isExporting || predictions === null ? {} : { scale: 1.04 }}
-          whileTap={isExporting || predictions === null ? {} : { scale: 0.97 }}
+          whileTap={isExporting  || predictions === null ? {} : { scale: 0.97 }}
           className="relative px-10 py-4 rounded-2xl font-bold text-sm tracking-wide text-white overflow-hidden group"
           style={{
             background: isExporting
               ? "linear-gradient(135deg, #4c1d95, #3730a3)"
               : "linear-gradient(135deg, #7c3aed 0%, #6d28d9 50%, #4f46e5 100%)",
-            boxShadow:
-              "0 0 0 1px rgba(168,85,247,0.3), 0 8px 32px rgba(109,40,217,0.4), 0 2px 0 rgba(255,255,255,0.1) inset",
-            opacity: predictions === null ? 0.45 : 1,
-            cursor: isExporting || predictions === null ? "default" : "pointer",
+            boxShadow:  "0 0 0 1px rgba(168,85,247,0.3), 0 8px 32px rgba(109,40,217,0.4), 0 2px 0 rgba(255,255,255,0.1) inset",
+            opacity:    predictions === null ? 0.45 : 1,
+            cursor:     isExporting || predictions === null ? "default" : "pointer",
           }}
         >
           <div
             className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-300"
-            style={{ background: "linear-gradient(135deg, rgba(255,255,255,0.15) 0%, transparent 60%)" }}
+            style={{ background:"linear-gradient(135deg, rgba(255,255,255,0.15) 0%, transparent 60%)" }}
           />
           <span className="relative flex items-center gap-2">
             {isExporting ? (
@@ -663,7 +673,7 @@ export default function ShareCard({ username, predictions, searchedProfile }: Sh
                   animate={{ rotate: 360 }}
                   transition={{ duration: 0.9, repeat: Infinity, ease: "linear" }}
                   className="inline-block w-4 h-4 rounded-full border-2"
-                  style={{ borderColor: "rgba(255,255,255,0.2)", borderTopColor: "rgba(255,255,255,0.9)" }}
+                  style={{ borderColor:"rgba(255,255,255,0.2)", borderTopColor:"rgba(255,255,255,0.9)" }}
                 />
                 Preparing image…
               </>
