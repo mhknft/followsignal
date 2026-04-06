@@ -460,7 +460,8 @@ function fillSlots(
 
 // ─── Category label (tier + follower count) ──────────────────────────────────
 
-function categoryFromTier(tier: Tier, followers: number): string {
+function categoryFromTier(tier: Tier, followers: number, isFallback = false): string {
+  if (isFallback) return followers >= 10_000 ? "Possible Next" : "Weak Signal";
   if (tier === 1) return followers >= 500_000 ? "Rare Pick"      : "Strong Match";
   if (tier === 2) return followers >= 100_000 ? "Near Orbit"     : "High Potential";
   return                 followers >= 50_000  ? "Watchlist"      : "Possible Next";
@@ -638,6 +639,83 @@ export async function GET(
       }
     }
 
+    // ── 6b. Fallback Pass D: use reverse-follow candidates when still < 5 ──────
+    // Triggered when the scanned user's follow graph is too sparse to fill 5
+    // slots (e.g. accounts that follow very few people).  We look at *followers*
+    // (accounts that follow the scanned user but aren't followed back) and score
+    // up to 500 of them.  Score floor is lowered to 400 so we still surface
+    // meaningful accounts even in thin networks.
+    let fallbackUsed  = false;
+    let emergencyUsed = false;
+
+    if (filtered.length < 5 && followers.length > 0) {
+      fallbackUsed = true;
+      console.log(`\n[scan] ── Pass D (reverse-follow fallback): ${5 - filtered.length} slot(s) still needed…`);
+
+      const alreadyUsed  = new Set(filtered.map((c) => c.username.toLowerCase()));
+      const followingSet = new Set(following.map((u) => u.username.toLowerCase().replace(/^@/, "")));
+
+      // Only score followers who the user doesn't follow back (true one-way fans)
+      const reverseCandidates = followers
+        .filter((acc) => acc.username.length > 0)
+        .filter((acc) => !followingSet.has(acc.username.toLowerCase().replace(/^@/, "")))
+        .filter((acc) => !alreadyUsed.has(acc.username.toLowerCase()))
+        .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
+        .sort((a, b) => b.followers - a.followers)
+        .slice(0, 500);
+
+      console.log(`  Reverse candidates (followers not followed back): ${reverseCandidates.length}`);
+
+      if (reverseCandidates.length > 0) {
+        const reverseScores = await Promise.all(reverseCandidates.map((acc) => fetchScore(acc.username)));
+        const reverseScored = reverseCandidates.map((acc, i) => ({ ...acc, score: reverseScores[i] }));
+
+        const needed = 5 - filtered.length;
+        const reverseValid = reverseScored
+          .filter(isValid)
+          .filter((c) => c.score > 0)
+          .filter((c) => c.score >= 400) // lower floor for fallback
+          .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, needed);
+
+        console.log(`  Pass D qualified: ${reverseValid.length}`);
+
+        for (const c of reverseValid) {
+          filtered.push({ ...c, tier: 3 as Tier });
+          alreadyUsed.add(c.username.toLowerCase());
+        }
+      }
+    }
+
+    // ── 6c. Emergency fallback: if still < 5, lower floor further to 0 ─────────
+    // Last possible resort — accepts any valid scored account.
+    if (filtered.length < 5) {
+      emergencyUsed = true;
+      console.log(`\n[scan] ── Emergency fallback: ${5 - filtered.length} slot(s) still empty, lowering floor to 0…`);
+
+      const alreadyUsed = new Set(filtered.map((c) => c.username.toLowerCase()));
+      const allCandidates = [...candidateList, ...followers]
+        .filter((acc) => !alreadyUsed.has(acc.username.toLowerCase().replace(/^@/, "")))
+        .filter((acc) => !isFiltered(acc.name, acc.username, acc.followers))
+        .sort((a, b) => b.followers - a.followers)
+        .slice(0, 200);
+
+      const emergencyScores = await Promise.all(allCandidates.map((acc) => fetchScore(acc.username)));
+      const emergencyScored = allCandidates
+        .map((acc, i) => ({ ...acc, score: emergencyScores[i] }))
+        .filter(isValid)
+        .filter((c) => c.score > 0)
+        .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
+        .sort((a, b) => b.score - a.score);
+
+      const needed = 5 - filtered.length;
+      for (const c of emergencyScored.slice(0, needed)) {
+        filtered.push({ ...c, tier: 3 as Tier });
+      }
+      console.log(`  Emergency fallback added: ${emergencyScored.slice(0, needed).length}`);
+    }
+
     if (!exhausted && filtered.length < 5) exhausted = true;
 
     // ── 7. Debug summary ──────────────────────────────────────────────────────
@@ -669,6 +747,8 @@ export async function GET(
     console.log(`  Total candidates scored        : ${allScored.length} (${totalNonZero} non-zero)`);
     console.log(`  Eligible (primary floor)       : ${eligibleCount}`);
     console.log(`  Exhausted pool                 : ${exhausted}`);
+    console.log(`  Fallback Pass D used           : ${fallbackUsed}`);
+    console.log(`  Emergency fallback used        : ${emergencyUsed}`);
     console.log(`  Tier 1: ${tierCounts[1]}  Tier 2: ${tierCounts[2]}  Tier 3: ${tierCounts[3]}`);
     console.log(`\n[scan] FINAL RESULTS (${filtered.length}):`);
     filtered.forEach((c, i) => {
@@ -693,14 +773,17 @@ export async function GET(
     const maxScore = wildcard.score || 1;
 
     const predictions: PredictedAccount[] = ordered.map((entry, i) => {
-      const isWild = i === ordered.length - 1;
+      const isWild     = i === ordered.length - 1;
+      // Entries added by fallback Pass D / emergency have tier=3 and lower scores;
+      // flag them so categoryFromTier can assign an appropriate label.
+      const isFallback = (fallbackUsed || emergencyUsed) && entry.score < base;
       return {
         id: i + 1,
         name: entry.name,
         username: `@${entry.username}`,
         avatar: entry.avatar,
         followers: entry.followers,
-        category: categoryFromTier(entry.tier, entry.followers),
+        category: categoryFromTier(entry.tier, entry.followers, isFallback),
         score: entry.score,
         matchPercent: Math.round((entry.score / maxScore) * 100),
         reason: buildReason(entry.score, entry.followers, entry.name, entry.tier),

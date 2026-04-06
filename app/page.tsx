@@ -109,7 +109,7 @@ export default function Home() {
           className="text-base leading-relaxed mb-10 max-w-sm"
           style={{ color: "rgba(180,150,230,0.5)" }}
         >
-          Scan any X profile and reveal the 5 biggest accounts most likely to follow next — powered by AI signal mapping.
+          Scan any X profile and reveal the 5 biggest accounts most likely to follow next, powered by AI signal mapping.
         </motion.p>
 
         {/* Input */}

@@ -8,7 +8,7 @@ const geistSans = Geist({
 });
 
 export const metadata: Metadata = {
-  title: "FollowSignal — AI Prediction Engine",
+  title: "FollowSignal: AI Prediction Engine",
   description:
     "Discover the 5 biggest accounts most likely to follow you next. Powered by AI.",
 };
