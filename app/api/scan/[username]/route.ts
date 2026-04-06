@@ -10,6 +10,7 @@ const HARD_BLACKLIST = new Set([
   "openai", "grok", "google", "youtube", "instagram", "facebook", "telegram",
   "discord", "linkedin", "microsoft", "apple", "samsung", "github",
   "notionhq", "canva", "anthropicai", "moltbook", "openclaw",
+  "balajis", "saylor", "jack",
 ]);
 
 /** Normalise a username: lowercase, strip leading @, trim whitespace. */
