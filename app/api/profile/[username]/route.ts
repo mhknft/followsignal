@@ -11,13 +11,13 @@ function pick(obj: Record<string, any>, ...keys: string[]): unknown {
   return undefined;
 }
 
-/** Unwrap a nested Sorsa envelope to find the real data object. */
+/** Unwrap nested Sorsa envelope shapes to find the real user-data object. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function unwrap(raw: unknown): Record<string, any> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const obj = raw as Record<string, any>;
-  for (const key of ["data", "user", "result", "profile"]) {
+  for (const key of ["data", "user", "result", "profile", "account", "info"]) {
     if (obj[key] && typeof obj[key] === "object" && !Array.isArray(obj[key])) {
       return obj[key];
     }
@@ -36,15 +36,15 @@ function extractScore(raw: unknown): number {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const top = raw as Record<string, any>;
 
-  const direct = pick(top, "score", "sorsaScore", "sorsa_score", "orbitScore");
+  const direct = pick(top, "score", "sorsaScore", "sorsa_score", "orbitScore", "orbit_score");
   if (direct !== undefined) {
     const n = Number(direct);
     return isNaN(n) ? 0 : n;
   }
 
-  for (const key of ["data", "user", "result", "profile"]) {
+  for (const key of ["data", "user", "result", "profile", "account"]) {
     if (top[key] && typeof top[key] === "object") {
-      const nested = pick(top[key], "score", "sorsaScore", "sorsa_score", "orbitScore");
+      const nested = pick(top[key], "score", "sorsaScore", "sorsa_score", "orbitScore", "orbit_score");
       if (nested !== undefined) {
         const n = Number(nested);
         return isNaN(n) ? 0 : n;
@@ -52,6 +52,20 @@ function extractScore(raw: unknown): number {
     }
   }
   return 0;
+}
+
+/**
+ * Parse a numeric field from raw API data.
+ * Returns the parsed number if the field exists, or null if not present.
+ * Callers must distinguish "API returned 0" from "field absent" — never default
+ * a missing field to 0 silently.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseNumber(src: Record<string, any>, ...keys: string[]): number | null {
+  const val = pick(src, ...keys);
+  if (val === undefined || val === null) return null;
+  const n = Number(val);
+  return isNaN(n) ? null : n;
 }
 
 async function sorsaFetch(path: string): Promise<unknown> {
@@ -70,7 +84,6 @@ export async function GET(
   const { username } = await params;
   const enc = encodeURIComponent(username);
 
-  // Fetch /info and /score in parallel
   const [infoResult, scoreResult] = await Promise.allSettled([
     sorsaFetch(`/info?username=${enc}`),
     sorsaFetch(`/score?username=${enc}`),
@@ -79,22 +92,41 @@ export async function GET(
   const infoRaw  = infoResult.status  === "fulfilled" ? infoResult.value  : null;
   const scoreRaw = scoreResult.status === "fulfilled" ? scoreResult.value : null;
 
-  console.log("[profile] /info raw:", JSON.stringify(infoRaw));
-  console.log("[profile] /score raw:", JSON.stringify(scoreRaw));
+  // Detailed logs so we can diagnose missing-field cases
+  console.log("[profile] /info status:", infoResult.status);
+  if (infoResult.status === "rejected") {
+    console.log("[profile] /info error:", infoResult.reason);
+  } else {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rawObj = infoRaw as Record<string, any> | null;
+    console.log("[profile] /info top-level keys:", rawObj ? Object.keys(rawObj) : "null");
+    console.log("[profile] /info raw:", JSON.stringify(infoRaw).slice(0, 800));
+  }
+
+  console.log("[profile] /score status:", scoreResult.status);
+  if (scoreResult.status === "rejected") {
+    console.log("[profile] /score error:", scoreResult.reason);
+  } else {
+    console.log("[profile] /score raw:", JSON.stringify(scoreRaw).slice(0, 400));
+  }
 
   const src = unwrap(infoRaw);
+  console.log("[profile] unwrapped keys:", Object.keys(src));
 
   const displayName = String(
     pick(src, "name", "displayName", "display_name", "fullName", "full_name") ?? username,
   ).trim() || username;
 
   const rawUsername = String(
-    pick(src, "username", "handle", "screen_name", "userName") ?? username,
+    pick(src, "username", "handle", "screen_name", "userName", "user_name") ?? username,
   ).replace(/^@/, "").trim() || username;
 
   const rawAvatar = String(
-    pick(src, "profileImageUrl", "profile_image_url", "profileImage",
-         "profile_image", "avatar", "avatarUrl", "avatar_url", "photo") ?? "",
+    pick(src,
+      "profileImageUrl", "profile_image_url", "profileImage", "profile_image",
+      "avatarUrl", "avatar_url", "avatar", "photo", "picture", "image",
+      "profile_image_url_https",
+    ) ?? "",
   ).trim();
 
   const avatar = rawAvatar
@@ -105,21 +137,29 @@ export async function GET(
     pick(src, "description", "bio", "about", "summary") ?? "",
   ).trim();
 
-  const followers = Number(
-    pick(src, "followers_count", "followersCount", "followers", "follower_count") ?? 0,
-  );
-
-  const following = Number(
-    pick(src, "followings_count", "followingCount", "following", "following_count",
-         "friends_count") ?? 0,
-  );
-
   const verified = Boolean(
-    pick(src, "verified", "isVerified", "is_verified"),
+    pick(src, "verified", "isVerified", "is_verified", "blue_verified"),
   );
 
-  // Use the real Sorsa score for display — no artificial floor.
-  // The 800 floor is only applied inside the scan/recommendation logic.
+  // Parse followers / following as nullable: null means "not returned by API".
+  // We store -1 as a sentinel so the UI can hide counters vs showing fake zeros.
+  const followersRaw = parseNumber(
+    src,
+    "followers_count", "followersCount", "followers", "follower_count",
+    "followerscount", "numFollowers",
+  );
+  const followingRaw = parseNumber(
+    src,
+    "friends_count", "followings_count", "followingCount", "following",
+    "following_count", "followingcount",
+  );
+
+  console.log("[profile] parsed followers:", followersRaw, "  following:", followingRaw);
+
+  // -1 = field was absent from API response (not a real 0)
+  const followers = followersRaw !== null ? followersRaw : -1;
+  const following = followingRaw !== null ? followingRaw : -1;
+
   const score = extractScore(scoreRaw);
 
   const profile: SearchedProfile = {
@@ -127,8 +167,8 @@ export async function GET(
     username: rawUsername,
     avatar,
     bio,
-    followers: isNaN(followers) ? 0 : followers,
-    following: isNaN(following) ? 0 : following,
+    followers,
+    following,
     score,
     verified,
   };

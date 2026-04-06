@@ -10,6 +10,7 @@ interface HeroProfileProps {
 }
 
 function formatCount(n: number): string {
+  if (n < 0) return "N/A";  // -1 sentinel = field absent from API response
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1000) return (n / 1000).toFixed(1) + "K";
   return n.toString();

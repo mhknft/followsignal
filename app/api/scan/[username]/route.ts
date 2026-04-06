@@ -390,8 +390,10 @@ function fillSlots(
   const slotDefs = isHigh ? SLOT_DEFS_HIGH  : SLOT_DEFS_STANDARD;
   const widen    = isHigh ? WIDEN_HIGH       : WIDEN_STANDARD;
 
-  // Primary eligibility: score must be above (or equal for isHigh) profileScore.
-  const minEligible = isHigh ? profileScore : profileScore + 1;
+  // Primary eligibility: score must be strictly above profileScore in all cases.
+  // The final validation gate enforces score > profileScore anyway, but we apply
+  // it here too so we don't waste slot capacity on ineligible candidates.
+  const minEligible = profileScore + 1;
 
   const dedupSeen = new Set<string>();
   function dedup(c: NormalisedAccount): boolean {
@@ -432,22 +434,23 @@ function fillSlots(
     }
   }
 
-  // ── Pass C: last resort — any valid scored human account ≥ 800 ───────────
-  // Reaches accounts that are at or below profileScore.  Sorted descending so
-  // we always surface the highest-quality leftovers first.
+  // ── Pass C: last resort — any valid scored account above profileScore ────────
+  // Only reaches here when passes A+B can't fill 5 slots from the ideal windows.
+  // Still enforces: score must be > profileScore (never lower/equal).
   if (pool.length < 5) {
     const seenC = new Set<string>();
     const lastResort = allScored
       .filter(isValid)
       .filter((c) => c.score > 0)
       .filter((c) => c.score >= 800)
+      .filter((c) => c.score > profileScore)  // strict: must beat searched profile
       .filter((c) => {
         const k = c.username.toLowerCase();
         if (used.has(k) || seenC.has(k)) return false;
         seenC.add(k);
         return true;
       })
-      .sort((a, b) => b.score - a.score); // highest score first as fallback
+      .sort((a, b) => b.score - a.score);
     for (const c of lastResort) {
       if (pool.length >= 5) break;
       used.add(c.username);
@@ -674,7 +677,7 @@ export async function GET(
         const reverseValid = reverseScored
           .filter(isValid)
           .filter((c) => c.score > 0)
-          .filter((c) => c.score >= 400) // lower floor for fallback
+          .filter((c) => c.score > profileScore)  // must still beat searched profile
           .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
           .sort((a, b) => b.score - a.score)
           .slice(0, needed);
@@ -706,6 +709,7 @@ export async function GET(
         .map((acc, i) => ({ ...acc, score: emergencyScores[i] }))
         .filter(isValid)
         .filter((c) => c.score > 0)
+        .filter((c) => c.score > profileScore)  // still enforced even in emergency
         .filter((c) => !alreadyUsed.has(c.username.toLowerCase()))
         .sort((a, b) => b.score - a.score);
 
@@ -758,8 +762,56 @@ export async function GET(
     console.log(`  Returned: ${filtered.map((c) => `@${c.username}`).join(", ")}`);
     console.log(`${"═".repeat(60)}\n`);
 
+    // ── 9b. STRICT FINAL VALIDATION GATE ──────────────────────────────────────
+    // Every candidate in `filtered` must pass all four rules before being shown.
+    // Any that fail are logged and dropped; we never show an invalid suggestion.
+    //
+    // Rules (cannot be relaxed):
+    //   1. Has a non-empty username
+    //   2. Has score > profileScore (strictly higher — never equal or lower)
+    //   3. Not in the follower set (not already following back)
+    //   4. Not blacklisted
+    //   5. Unique (no duplicate usernames in final output)
+    //
+    console.log(`\n[scan] ── FINAL VALIDATION GATE (${filtered.length} candidates) ──`);
+    console.log(`  Searched username : @${username}`);
+    console.log(`  Searched score   : ${profileScore}`);
+    console.log(`  Follower set size: ${followsBackSet.size}`);
+
+    const finalSeen = new Set<string>();
+    const validated = filtered.filter((c) => {
+      const key = c.username.toLowerCase().replace(/^@/, "");
+
+      if (!c.username || key.length === 0) {
+        console.log(`  REJECT @${c.username || "?"}: empty username`);
+        return false;
+      }
+      if (finalSeen.has(key)) {
+        console.log(`  REJECT @${key}: duplicate`);
+        return false;
+      }
+      if (c.score <= profileScore) {
+        console.log(`  REJECT @${key}: score ${c.score} <= searched score ${profileScore}`);
+        return false;
+      }
+      if (followsBackSet.has(key)) {
+        console.log(`  REJECT @${key}: already follows back (in follower set)`);
+        return false;
+      }
+      if (isFiltered(c.name, key, c.followers)) {
+        console.log(`  REJECT @${key}: blacklisted`);
+        return false;
+      }
+
+      finalSeen.add(key);
+      console.log(`  PASS   @${key}: score=${c.score}`);
+      return true;
+    });
+
+    console.log(`  Gate result: ${validated.length} / ${filtered.length} passed`);
+
     // ── 10. Empty state ───────────────────────────────────────────────────────
-    if (filtered.length === 0) {
+    if (validated.length === 0) {
       return NextResponse.json({
         predictions: [],
         exhausted: true,
@@ -767,15 +819,21 @@ export async function GET(
       });
     }
 
+    // Use validated list from here on
+    const finalFiltered = validated;
+
     // ── 11. Build PredictedAccount array ─────────────────────────────────────
-    const [wildcard, ...corners] = filtered;
+    const [wildcard, ...corners] = finalFiltered;
     const ordered = [...corners, wildcard];
     const maxScore = wildcard.score || 1;
 
+    console.log(`\n[scan] RETURNING ${finalFiltered.length} accounts:`);
+    finalFiltered.forEach((c, i) => {
+      console.log(`  ${i + 1}. @${c.username}  score=${Math.round(c.score)}`);
+    });
+
     const predictions: PredictedAccount[] = ordered.map((entry, i) => {
       const isWild     = i === ordered.length - 1;
-      // Entries added by fallback Pass D / emergency have tier=3 and lower scores;
-      // flag them so categoryFromTier can assign an appropriate label.
       const isFallback = (fallbackUsed || emergencyUsed) && entry.score < base;
       return {
         id: i + 1,
