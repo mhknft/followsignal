@@ -157,6 +157,25 @@ async function fetchAllPages(basePath: string, maxPages = 5): Promise<Candidate[
   return all;
 }
 
+/**
+ * Follower-count → conservative Sorsa-score estimate.
+ * Used ONLY as a last resort when Sorsa returns 0 (account unindexed) and
+ * fewer than 5 real-score candidates exist. Estimated accounts are always
+ * preferred last within any slot so real scores take priority.
+ */
+function estimateScoreFromFollowers(followers: number): number {
+  if (followers >= 1_000_000) return 2800;
+  if (followers >=   500_000) return 2300;
+  if (followers >=   200_000) return 1900;
+  if (followers >=   100_000) return 1600;
+  if (followers >=    50_000) return 1400;
+  if (followers >=    20_000) return 1200;
+  if (followers >=    10_000) return 1000;
+  if (followers >=     5_000) return  850;
+  if (followers >=     1_000) return  650;
+  return 400;
+}
+
 /** Fetch the Sorsa score for a single account. Returns 0 on any failure. */
 async function fetchScore(username: string): Promise<number> {
   try {
@@ -239,7 +258,7 @@ function selectBySlots(
       { lo: profileScore + slot.minGap * 0.75, hi },                                       // –25 % lower
       { lo: profileScore + slot.minGap * 0.50, hi: hi === Infinity ? hi : hi * 1.25 },    // –50 % lower, +25 % upper
       { lo: profileScore + slot.minGap * 0.25, hi: hi === Infinity ? hi : hi * 1.50 },    // –75 % lower, +50 % upper
-      { lo: profileScore,                       hi: Infinity },                            // any valid candidate
+      { lo: 0,                                  hi: Infinity },                            // any candidate in eligible pool
     ];
 
     let pick: Candidate | undefined;
@@ -378,24 +397,24 @@ export async function GET(
     const withListScore    = sorted.filter((c) => c.score > 0);
     const withoutListScore = sorted.filter((c) => c.score === 0);
 
-    // Pass A — instant classification from list scores
-    const validCandidates: Candidate[] = [];
+    // Pass A — collect all accounts with a list score > 0.
+    // Score-floor filtering is deferred to step 5 so we can relax it if needed.
+    const allScoredPool: Candidate[] = [];
     for (const c of withListScore) {
-      if (c.score > profileScore) {
-        validCandidates.push(c);
-        console.log(`  VALID (list)    @${c.username}: score=${Math.round(c.score)}`);
+      if (c.score > 0) {
+        allScoredPool.push(c);
+        console.log(`  scored (list)    @${c.username}: score=${Math.round(c.score)}`);
       } else {
-        rejectionLog.push({
-          username: c.username,
-          reason: `score too low (${Math.round(c.score)} ≤ ${Math.round(profileScore)})`,
-        });
+        rejectionLog.push({ username: c.username, reason: "missing score" });
       }
     }
 
-    // Pass B — fetch /score for zero-score accounts in batches of 50
-    // Early-stop once we have ≥ 5 valid candidates.
+    // Pass B — fetch /score for zero-score accounts in batches of 50.
+    // Accounts that return 0 from Sorsa (unindexed) are saved separately for
+    // the follower-estimate fallback in step 5.
     const SCORE_BATCH = 50;
     let scoredCount = withListScore.length;
+    const unindexedCandidates: Candidate[] = []; // score=0 from Sorsa — used for estimation fallback
 
     if (withoutListScore.length > 0) {
       console.log(`[scan] Pass B: fetching scores for ${withoutListScore.length} zero-score accounts…`);
@@ -410,39 +429,83 @@ export async function GET(
 
           if (score === 0) {
             rejectionLog.push({ username: acc.username, reason: "missing score" });
-          } else if (score > profileScore) {
-            validCandidates.push({ ...acc, score });
-            console.log(`  VALID (fetched) @${acc.username}: score=${score}`);
+            unindexedCandidates.push(acc); // keep for estimation fallback
           } else {
-            rejectionLog.push({
-              username: acc.username,
-              reason: `score too low (${score} ≤ ${Math.round(profileScore)})`,
-            });
+            allScoredPool.push({ ...acc, score });
+            console.log(`  scored (fetched) @${acc.username}: score=${score}`);
           }
         }
-        console.log(`  Pass B offset=${i + SCORE_BATCH}: validSoFar=${validCandidates.length}`);
+        console.log(`  Pass B offset=${i + SCORE_BATCH}: poolSize=${allScoredPool.length}`);
       }
     }
 
-    // ── 5. Assign candidates to orbit-gap slots ───────────────────────────────
-    console.log(`\n[scan] Slot assignment (profileScore=${Math.round(profileScore)}, table=${profileScore >= 1500 ? "HIGH" : "STANDARD"}):`);
-    const slotted = selectBySlots(validCandidates, profileScore);
+    // ── 5. Slot assignment with progressive score-floor relaxation ────────────
+    // Start strict (score > profileScore). If fewer than 5 slots fill, lower
+    // the floor by 10 % per step so we always return a full set when enough
+    // scored candidates exist. Blacklist and followback are never relaxed.
+    const SCORE_FLOORS = [1.00, 0.85, 0.70, 0.55, 0.40, 0.25, 0].map(f => profileScore * f);
+    let slotted: SlottedCandidate[] = [];
+    let activeFloor = profileScore;
 
-    console.log(`\n[scan] RESULTS: ${slotted.length} slot(s) filled:`);
+    for (const floor of SCORE_FLOORS) {
+      activeFloor = floor;
+      const eligible = allScoredPool.filter(c => c.score > floor);
+      console.log(`\n[scan] Slot attempt — floor=${Math.round(floor)} (${Math.round((floor / Math.max(profileScore, 1)) * 100)}%), eligible=${eligible.length}:`);
+      slotted = selectBySlots(eligible, profileScore);
+      console.log(`  → ${slotted.length} slot(s) filled`);
+      if (slotted.length >= 5) break;
+    }
+
+    // ── 5b. Estimation fallback — only when real scores can't fill 5 slots ──────
+    // Apply follower-count estimates to Sorsa-unindexed accounts and merge into
+    // the pool for one more slot-fill attempt.  Estimated entries sort below
+    // real-score entries at equivalent gaps because estimateScoreFromFollowers
+    // returns conservative values that rarely exceed real Sorsa scores.
+    if (slotted.length < 5 && unindexedCandidates.length > 0) {
+      console.log(`\n[scan] Estimation fallback: ${unindexedCandidates.length} unindexed accounts → applying follower estimates…`);
+      const estimatedPool = unindexedCandidates
+        .map(c => ({ ...c, score: estimateScoreFromFollowers(c.followers), scoreEstimated: true }))
+        .filter(c => c.score > 0);
+
+      const combined = [...allScoredPool, ...estimatedPool];
+      for (const floor of SCORE_FLOORS) {
+        const eligible = combined.filter(c => c.score > floor);
+        slotted = selectBySlots(eligible, profileScore);
+        activeFloor = floor;
+        if (slotted.length >= 5) break;
+      }
+      console.log(`  Estimation fallback result: ${slotted.length} slot(s) filled`);
+    }
+
+    console.log(`\n[scan] RESULTS: ${slotted.length} slot(s) filled (floor=${Math.round(activeFloor)}):`);
     slotted.forEach(({ candidate: c, isRarePick }, i) =>
-      console.log(`  ${i + 1}. @${c.username.padEnd(24)}  score=${Math.round(c.score)}  gap=+${Math.round(c.score - profileScore)}${isRarePick ? "  ★" : ""}`),
+      console.log(`  ${i + 1}. @${c.username.padEnd(24)}  score=${Math.round(c.score)}  gap=${Math.round(c.score - profileScore) >= 0 ? "+" : ""}${Math.round(c.score - profileScore)}${isRarePick ? "  ★" : ""}`),
     );
+
+    // Log every scored-but-unselected account.
+    const selectedKeys = new Set(slotted.map(s => s.candidate.username));
+    for (const c of allScoredPool) {
+      if (!selectedKeys.has(c.username)) {
+        rejectionLog.push({
+          username: c.username,
+          reason: c.score <= activeFloor
+            ? `score too low (${Math.round(c.score)} ≤ floor ${Math.round(activeFloor)})`
+            : "not selected by slot assignment",
+        });
+      }
+    }
 
     // ── 6. Debug object ───────────────────────────────────────────────────────
     const debugInfo = {
       profileScore:            Math.round(profileScore),
       slotTable:               profileScore >= 1500 ? "HIGH" : "STANDARD",
+      scoreFloorUsed:          Math.round(activeFloor),
       followingCheckedCount:   following.length,
       followerSetCount:        followers.length,
       blacklistRemovedCount,
       followBackRemovedCount,
       scoredCount,
-      aboveProfileScoreCount:  validCandidates.length,
+      aboveProfileScoreCount:  allScoredPool.filter(c => c.score > profileScore).length,
       finalCandidateUsernames: slotted.map(({ candidate: c }) => `@${c.username}`),
       rejections:              rejectionLog,
     };
