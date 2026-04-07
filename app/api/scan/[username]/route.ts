@@ -206,13 +206,16 @@ type SlottedCandidate = { candidate: Candidate; isRarePick: boolean };
 /**
  * Assign valid candidates (score > profileScore) to the five orbit slots.
  *
- * For each slot:
+ * Each slot tries five progressively wider passes before giving up:
  *   Pass 1 — exact range [minGap, maxGap).
- *   Pass 2 — widen the lower bound by 25 % (bridges inter-slot gaps in STANDARD).
- * If neither pass finds a candidate the slot is left empty — no force-filling.
+ *   Pass 2 — lower bound –25 %, same upper.
+ *   Pass 3 — lower bound –50 %, upper +25 %.
+ *   Pass 4 — lower bound –75 %, upper +50 %.
+ *   Pass 5 — any remaining valid candidate (ignore range entirely).
  *
- * Within a range, the candidate with the smallest gap (ascending score) is
- * chosen so the ladder stays as natural as possible.
+ * Pass 5 guarantees all 5 slots are filled whenever 5+ valid candidates exist,
+ * so the UI always shows a full constellation.  The ascending-score sort means
+ * the smallest available gap is always chosen first, keeping the ladder natural.
  */
 function selectBySlots(
   validCandidates: Candidate[],
@@ -222,28 +225,36 @@ function selectBySlots(
   const used   = new Set<string>();
   const result: SlottedCandidate[] = [];
 
-  // Ascending by score — pick smallest qualifying gap first within each slot.
+  // Ascending by score — smallest gap wins within every pass.
   const byScore = [...validCandidates].sort((a, b) => a.score - b.score);
 
   for (const slot of slots) {
-    const lo    = profileScore + slot.minGap;
-    const hi    = slot.maxGap === 0 ? Infinity : profileScore + slot.maxGap;
-    const loWide = profileScore + slot.minGap * 0.75; // widen lower bound by 25 %
+    const lo = profileScore + slot.minGap;
+    const hi = slot.maxGap === 0 ? Infinity : profileScore + slot.maxGap;
 
-    // Pass 1: exact range
-    let pick = byScore.find(c => !used.has(c.username) && c.score >= lo && c.score < hi);
+    // Five widening passes — each expands the window until a candidate is found.
+    const passes = [
+      { lo,                                    hi },                                       // exact
+      { lo: profileScore + slot.minGap * 0.75, hi },                                       // –25 % lower
+      { lo: profileScore + slot.minGap * 0.50, hi: hi === Infinity ? hi : hi * 1.25 },    // –50 % lower, +25 % upper
+      { lo: profileScore + slot.minGap * 0.25, hi: hi === Infinity ? hi : hi * 1.50 },    // –75 % lower, +50 % upper
+      { lo: profileScore,                       hi: Infinity },                            // any valid candidate
+    ];
 
-    // Pass 2: wider lower bound (catches candidates in inter-slot gaps)
-    if (!pick) {
-      pick = byScore.find(c => !used.has(c.username) && c.score >= loWide && c.score < hi);
+    let pick: Candidate | undefined;
+    let passUsed = 0;
+    for (const p of passes) {
+      passUsed++;
+      pick = byScore.find(c => !used.has(c.username) && c.score >= p.lo && c.score < p.hi);
+      if (pick) break;
     }
 
     if (pick) {
       used.add(pick.username);
       result.push({ candidate: pick, isRarePick: slot.isRarePick });
-      console.log(`  slot[${slot.minGap}–${slot.maxGap || "∞"}] → @${pick.username}  score=${Math.round(pick.score)}${slot.isRarePick ? "  ★ Rare Pick" : ""}`);
+      console.log(`  slot[${slot.minGap}–${slot.maxGap || "∞"}] pass${passUsed} → @${pick.username}  score=${Math.round(pick.score)}${slot.isRarePick ? "  ★ Rare Pick" : ""}`);
     } else {
-      console.log(`  slot[${slot.minGap}–${slot.maxGap || "∞"}] → (empty)`);
+      console.log(`  slot[${slot.minGap}–${slot.maxGap || "∞"}] → (empty — no valid candidates remain)`);
     }
   }
 
