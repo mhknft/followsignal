@@ -13,6 +13,7 @@ const HARD_BLACKLIST = new Set([
   "balajis", "saylor", "jack", "claudeai", "skyecosystem",
   "aave", "wublockchain", "aztecnetwork", "sushiswap",
   "perplexity_ai", "kalshi", "eigencloud", "ethena", "rally_xyz",
+  "noise_xyz", "r3achntwrk",
 ]);
 
 /** Normalise a username: lowercase, strip leading @, trim whitespace. */
