@@ -165,6 +165,90 @@ async function fetchScore(username: string): Promise<number> {
   }
 }
 
+// ─── Gap-based slot tables ────────────────────────────────────────────────────
+//
+// Each of the 5 result cards targets a specific score-gap window above the
+// searched user's score, creating a natural "orbit ladder" progression.
+//
+// Standard (profileScore < 1500) — wider gaps, realistic for smaller accounts:
+//   Slot 1: +200–300  |  Slot 2: +400–600  |  Slot 3: +600–800
+//   Slot 4: +800–1000  |  Slot 5: +1000+ (Rare Pick stretch)
+//
+// High (profileScore ≥ 1500) — tighter gaps, denser high-score network:
+//   Slot 1: +100–300  |  Slot 2: +300–500  |  Slot 3: +500–700
+//   Slot 4: +700–1000  |  Slot 5: +1000+ (Rare Pick stretch)
+
+interface SlotDef {
+  minGap:     number;  // lower bound for (score − profileScore), inclusive
+  maxGap:     number;  // upper bound for (score − profileScore), exclusive; 0 = unbounded
+  isRarePick: boolean;
+}
+
+const SLOTS_STANDARD: SlotDef[] = [
+  { minGap:  200, maxGap:  300, isRarePick: false },
+  { minGap:  400, maxGap:  600, isRarePick: false },
+  { minGap:  600, maxGap:  800, isRarePick: false },
+  { minGap:  800, maxGap: 1000, isRarePick: false },
+  { minGap: 1000, maxGap:    0, isRarePick: true  }, // unbounded upper end
+];
+
+const SLOTS_HIGH: SlotDef[] = [
+  { minGap:  100, maxGap:  300, isRarePick: false },
+  { minGap:  300, maxGap:  500, isRarePick: false },
+  { minGap:  500, maxGap:  700, isRarePick: false },
+  { minGap:  700, maxGap: 1000, isRarePick: false },
+  { minGap: 1000, maxGap:    0, isRarePick: true  }, // unbounded upper end
+];
+
+type SlottedCandidate = { candidate: Candidate; isRarePick: boolean };
+
+/**
+ * Assign valid candidates (score > profileScore) to the five orbit slots.
+ *
+ * For each slot:
+ *   Pass 1 — exact range [minGap, maxGap).
+ *   Pass 2 — widen the lower bound by 25 % (bridges inter-slot gaps in STANDARD).
+ * If neither pass finds a candidate the slot is left empty — no force-filling.
+ *
+ * Within a range, the candidate with the smallest gap (ascending score) is
+ * chosen so the ladder stays as natural as possible.
+ */
+function selectBySlots(
+  validCandidates: Candidate[],
+  profileScore:    number,
+): SlottedCandidate[] {
+  const slots  = profileScore >= 1500 ? SLOTS_HIGH : SLOTS_STANDARD;
+  const used   = new Set<string>();
+  const result: SlottedCandidate[] = [];
+
+  // Ascending by score — pick smallest qualifying gap first within each slot.
+  const byScore = [...validCandidates].sort((a, b) => a.score - b.score);
+
+  for (const slot of slots) {
+    const lo    = profileScore + slot.minGap;
+    const hi    = slot.maxGap === 0 ? Infinity : profileScore + slot.maxGap;
+    const loWide = profileScore + slot.minGap * 0.75; // widen lower bound by 25 %
+
+    // Pass 1: exact range
+    let pick = byScore.find(c => !used.has(c.username) && c.score >= lo && c.score < hi);
+
+    // Pass 2: wider lower bound (catches candidates in inter-slot gaps)
+    if (!pick) {
+      pick = byScore.find(c => !used.has(c.username) && c.score >= loWide && c.score < hi);
+    }
+
+    if (pick) {
+      used.add(pick.username);
+      result.push({ candidate: pick, isRarePick: slot.isRarePick });
+      console.log(`  slot[${slot.minGap}–${slot.maxGap || "∞"}] → @${pick.username}  score=${Math.round(pick.score)}${slot.isRarePick ? "  ★ Rare Pick" : ""}`);
+    } else {
+      console.log(`  slot[${slot.minGap}–${slot.maxGap || "∞"}] → (empty)`);
+    }
+  }
+
+  return result;
+}
+
 // ─── Display helpers ──────────────────────────────────────────────────────────
 
 function formatScore(n: number): string {
@@ -200,11 +284,10 @@ function buildReason(
   return lines[Math.abs(Math.round(score)) % lines.length];
 }
 
-/** Simple category label — all results are above profileScore so labels reflect how far above. */
-function categoryLabel(score: number, profileScore: number, followers: number): string {
-  const delta = score - profileScore;
-  if (delta > profileScore * 0.5 || followers >= 200_000) return "Rare Pick";
-  if (delta > profileScore * 0.2 || followers >= 50_000)  return "Strong Match";
+/** Category label driven by slot assignment, not score thresholds. */
+function categoryLabel(followers: number, isRarePick: boolean): string {
+  if (isRarePick) return "Rare Pick";
+  if (followers >= 100_000) return "Strong Match";
   return "High Potential";
 }
 
@@ -328,26 +411,26 @@ export async function GET(
       }
     }
 
-    // ── 5. Sort descending by score, take top 5 ───────────────────────────────
-    const finalCandidates = validCandidates
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
+    // ── 5. Assign candidates to orbit-gap slots ───────────────────────────────
+    console.log(`\n[scan] Slot assignment (profileScore=${Math.round(profileScore)}, table=${profileScore >= 1500 ? "HIGH" : "STANDARD"}):`);
+    const slotted = selectBySlots(validCandidates, profileScore);
 
-    console.log(`\n[scan] RESULTS: ${finalCandidates.length} valid candidate(s):`);
-    finalCandidates.forEach((c, i) =>
-      console.log(`  ${i + 1}. @${c.username.padEnd(24)}  score=${Math.round(c.score)}`),
+    console.log(`\n[scan] RESULTS: ${slotted.length} slot(s) filled:`);
+    slotted.forEach(({ candidate: c, isRarePick }, i) =>
+      console.log(`  ${i + 1}. @${c.username.padEnd(24)}  score=${Math.round(c.score)}  gap=+${Math.round(c.score - profileScore)}${isRarePick ? "  ★" : ""}`),
     );
 
     // ── 6. Debug object ───────────────────────────────────────────────────────
     const debugInfo = {
       profileScore:            Math.round(profileScore),
+      slotTable:               profileScore >= 1500 ? "HIGH" : "STANDARD",
       followingCheckedCount:   following.length,
       followerSetCount:        followers.length,
       blacklistRemovedCount,
       followBackRemovedCount,
       scoredCount,
       aboveProfileScoreCount:  validCandidates.length,
-      finalCandidateUsernames: finalCandidates.map((c) => `@${c.username}`),
+      finalCandidateUsernames: slotted.map(({ candidate: c }) => `@${c.username}`),
       rejections:              rejectionLog,
     };
 
@@ -358,7 +441,7 @@ export async function GET(
     }, null, 2));
 
     // ── 7. Empty state ────────────────────────────────────────────────────────
-    if (finalCandidates.length === 0) {
+    if (slotted.length === 0) {
       const hasGraph = following.length > 0 || followers.length > 0;
       const message = !hasGraph && profileScore > 0
         ? "Follow network not indexed yet — Sorsa has your score but no graph data. Try again in a few hours."
@@ -375,22 +458,28 @@ export async function GET(
     }
 
     // ── 8. Build PredictedAccount array ──────────────────────────────────────
-    // Wildcard = the strongest account (index 0 after sort desc).
-    // Corners  = the remaining ≤ 4.
-    const [wildcard, ...corners] = finalCandidates;
-    const ordered = [...corners, wildcard];
+    // The Rare Pick slot (last slot) is the wildcard at bottom-center.
+    // Non-rare-pick slots fill the corner positions in slot order.
+    const rarePickEntry   = slotted.find(s => s.isRarePick);
+    const cornerEntries   = slotted.filter(s => !s.isRarePick);
+    // Wildcard = Rare Pick if it exists; otherwise the highest-gap result.
+    const wildcardEntry   = rarePickEntry ?? slotted[slotted.length - 1];
+    const orderedEntries  = [
+      ...cornerEntries.filter(s => s !== wildcardEntry),
+      wildcardEntry,
+    ];
 
     const matchRef = Math.max(profileScore, 1);
 
-    const predictions: PredictedAccount[] = ordered.map((entry, i) => {
-      const isWild = i === ordered.length - 1;
+    const predictions: PredictedAccount[] = orderedEntries.map(({ candidate: entry, isRarePick }, i) => {
+      const isWild = i === orderedEntries.length - 1;
       return {
         id:           i + 1,
         name:         entry.name,
         username:     `@${entry.username}`,
         avatar:       entry.avatar,
         followers:    entry.followers,
-        category:     categoryLabel(entry.score, profileScore, entry.followers),
+        category:     categoryLabel(entry.followers, isRarePick),
         score:        entry.score,
         matchPercent: Math.min(100, Math.round((entry.score / matchRef) * 100)),
         reason:       buildReason(entry.score, profileScore, entry.followers, entry.name),
@@ -401,7 +490,7 @@ export async function GET(
 
     return NextResponse.json({
       predictions,
-      exhausted: finalCandidates.length < 5,
+      exhausted: slotted.length < 5,
       debug: debugInfo,
     });
 
