@@ -13,7 +13,7 @@ const HARD_BLACKLIST = new Set([
   "balajis", "saylor", "jack", "claudeai", "skyecosystem",
   "aave", "wublockchain", "aztecnetwork", "sushiswap",
   "perplexity_ai", "kalshi", "eigencloud", "ethena", "rally_xyz",
-  "noise_xyz", "r3achntwrk",
+  "noise_xyz", "r3achntwrk", "nolimitgains", "jaileddotfun", "gvrt_io", "grvt_io",
 ]);
 
 /** Normalise a username: lowercase, strip leading @, trim whitespace. */
@@ -351,7 +351,7 @@ export async function GET(
         console.log("[scan] /score failed:", e); return null;
       }),
       fetchAllPages(`/follows?username=${enc}`,   5),
-      fetchAllPages(`/followers?username=${enc}`, 10),
+      fetchAllPages(`/followers?username=${enc}`, 25),
     ]);
 
     const profileScore = profileScoreRaw ? extractScore(profileScoreRaw) : 0;
@@ -439,41 +439,31 @@ export async function GET(
       }
     }
 
-    // ── 5. Slot assignment with progressive score-floor relaxation ────────────
-    // Start strict (score > profileScore). If fewer than 5 slots fill, lower
-    // the floor by 10 % per step so we always return a full set when enough
-    // scored candidates exist. Blacklist and followback are never relaxed.
-    const SCORE_FLOORS = [1.00, 0.85, 0.70, 0.55, 0.40, 0.25, 0].map(f => profileScore * f);
-    let slotted: SlottedCandidate[] = [];
-    let activeFloor = profileScore;
-
-    for (const floor of SCORE_FLOORS) {
-      activeFloor = floor;
-      const eligible = allScoredPool.filter(c => c.score > floor);
-      console.log(`\n[scan] Slot attempt — floor=${Math.round(floor)} (${Math.round((floor / Math.max(profileScore, 1)) * 100)}%), eligible=${eligible.length}:`);
-      slotted = selectBySlots(eligible, profileScore);
-      console.log(`  → ${slotted.length} slot(s) filled`);
-      if (slotted.length >= 5) break;
-    }
+    // ── 5. Slot assignment ────────────────────────────────────────────────────
+    // Hard requirement: score must ALWAYS be strictly above profileScore.
+    // This floor is never relaxed — we never recommend an account with a lower
+    // or equal Orbit score than the scanned user.
+    // The 5-pass slot widening inside selectBySlots handles cases where not
+    // enough candidates fall in the ideal gap ranges.
+    const activeFloor = profileScore;
+    const eligible = allScoredPool.filter(c => c.score > profileScore);
+    console.log(`\n[scan] Eligible (score > ${Math.round(profileScore)}): ${eligible.length} accounts`);
+    let slotted: SlottedCandidate[] = selectBySlots(eligible, profileScore);
+    console.log(`  → ${slotted.length} slot(s) filled`);
 
     // ── 5b. Estimation fallback — only when real scores can't fill 5 slots ──────
     // Apply follower-count estimates to Sorsa-unindexed accounts and merge into
-    // the pool for one more slot-fill attempt.  Estimated entries sort below
-    // real-score entries at equivalent gaps because estimateScoreFromFollowers
-    // returns conservative values that rarely exceed real Sorsa scores.
+    // the pool for one more slot-fill attempt. Estimated entries are filtered
+    // by the same hard floor (estimated score > profileScore).
     if (slotted.length < 5 && unindexedCandidates.length > 0) {
       console.log(`\n[scan] Estimation fallback: ${unindexedCandidates.length} unindexed accounts → applying follower estimates…`);
       const estimatedPool = unindexedCandidates
-        .map(c => ({ ...c, score: estimateScoreFromFollowers(c.followers), scoreEstimated: true }))
-        .filter(c => c.score > 0);
+        .map(c => ({ ...c, score: estimateScoreFromFollowers(c.followers) }))
+        .filter(c => c.score > profileScore);
 
-      const combined = [...allScoredPool, ...estimatedPool];
-      for (const floor of SCORE_FLOORS) {
-        const eligible = combined.filter(c => c.score > floor);
-        slotted = selectBySlots(eligible, profileScore);
-        activeFloor = floor;
-        if (slotted.length >= 5) break;
-      }
+      const combined = [...eligible, ...estimatedPool];
+      const slotted2 = selectBySlots(combined, profileScore);
+      if (slotted2.length > slotted.length) slotted = slotted2;
       console.log(`  Estimation fallback result: ${slotted.length} slot(s) filled`);
     }
 
@@ -488,8 +478,8 @@ export async function GET(
       if (!selectedKeys.has(c.username)) {
         rejectionLog.push({
           username: c.username,
-          reason: c.score <= activeFloor
-            ? `score too low (${Math.round(c.score)} ≤ floor ${Math.round(activeFloor)})`
+          reason: c.score <= profileScore
+            ? `score too low (${Math.round(c.score)} ≤ profileScore ${Math.round(profileScore)})`
             : "not selected by slot assignment",
         });
       }
